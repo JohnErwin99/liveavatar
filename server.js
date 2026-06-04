@@ -4,10 +4,20 @@ import cors from "cors";
 const app = express();
 app.use(express.json());
 
-// Lock this to your Webflow domain(s) so randoms can't spin up paid sessions.
-// e.g. ALLOWED_ORIGIN="https://your-site.com,https://your-site.webflow.io"
-const ORIGINS = (process.env.ALLOWED_ORIGIN || "*").split(",").map(s => s.trim());
-app.use(cors({ origin: ORIGINS.length === 1 && ORIGINS[0] === "*" ? "*" : ORIGINS }));
+// Allowed origins. If ALLOWED_ORIGIN is unset -> allow all. Otherwise allow the
+// listed origins PLUS any *.webflow.io subdomain (handy for staging).
+const ALLOW = (process.env.ALLOWED_ORIGIN || "")
+  .split(",").map(s => s.trim().replace(/\/+$/, "")).filter(Boolean);
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);                       // curl / server-to-server
+    const clean = origin.replace(/\/+$/, "");
+    if (ALLOW.length === 0) return cb(null, true);            // not configured -> allow all
+    if (ALLOW.includes(clean)) return cb(null, true);
+    try { if (/\.webflow\.io$/.test(new URL(origin).hostname)) return cb(null, true); } catch {}
+    return cb(null, false);
+  },
+}));
 
 const LA_KEY    = process.env.LIVEAVATAR_API_KEY;     // your (rotated) LiveAvatar key
 const SECRET_ID = process.env.LIVEAVATAR_SECRET_ID;   // from the one-time secret registration
