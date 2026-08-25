@@ -47,6 +47,69 @@ const D365 = {
 // HMAC secret from ElevenLabs post-call webhook setup (Agents settings > Webhooks).
 const EL_WEBHOOK_SECRET = process.env.ELEVENLABS_WEBHOOK_SECRET || "";
 
+// ---- ServiceNow (Ciprian's API) — leave unset until credentials arrive.
+// The /support/ticket endpoint runs in "queued" mode without them, so the
+// agent flow can ship first and light up when the integration is ready.
+const SN = {
+  instanceUrl: (process.env.SERVICENOW_INSTANCE_URL || "").replace(/\/+$/, ""),
+  user:        process.env.SERVICENOW_USER || "",
+  password:    process.env.SERVICENOW_PASSWORD || "",
+  table:       process.env.SERVICENOW_TABLE || "incident",
+};
+
+// ---- DocuSign (NDA sending) — JWT grant, no SDK needed.
+// Setup once in DocuSign Admin: create an app (integration key), generate an
+// RSA keypair, grant consent for "signature impersonation", and build the NDA
+// as a template with one recipient role named "Signer".
+const DS = {
+  authServer:     process.env.DOCUSIGN_AUTH_SERVER || "account-d.docusign.com", // account.docusign.com in prod
+  baseUrl:        (process.env.DOCUSIGN_BASE_URL || "").replace(/\/+$/, ""),     // e.g. https://demo.docusign.net/restapi
+  accountId:      process.env.DOCUSIGN_ACCOUNT_ID || "",
+  integrationKey: process.env.DOCUSIGN_INTEGRATION_KEY || "",
+  userId:         process.env.DOCUSIGN_USER_ID || "",
+  privateKey:     (process.env.DOCUSIGN_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+  ndaTemplateId:  process.env.DOCUSIGN_NDA_TEMPLATE_ID || "",
+};
+
+let dsToken = { value: null, exp: 0 };
+
+function b64url(input) {
+  return Buffer.from(input).toString("base64")
+    .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+async function getDocuSignToken() {
+  if (dsToken.value && Date.now() < dsToken.exp - 60000) return dsToken.value;
+  const now = Math.floor(Date.now() / 1000);
+  const header  = b64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const payload = b64url(JSON.stringify({
+    iss: DS.integrationKey,
+    sub: DS.userId,
+    aud: DS.authServer,
+    iat: now,
+    exp: now + 3600,
+    scope: "signature impersonation",
+  }));
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(`${header}.${payload}`);
+  const signature = signer.sign(DS.privateKey, "base64")
+    .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  const jwt = `${header}.${payload}.${signature}`;
+
+  const r = await fetch(`https://${DS.authServer}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt,
+    }),
+  });
+  const json = await r.json();
+  if (!json.access_token) throw new Error("DocuSign token failed: " + JSON.stringify(json));
+  dsToken = { value: json.access_token, exp: Date.now() + json.expires_in * 1000 };
+  return dsToken.value;
+}
+
 let d365Token = { value: null, exp: 0 };
 
 async function getD365Token() {
@@ -88,6 +151,15 @@ app.get("/config", (_req, res) => res.json({
   D365_OWNER_USER_ID:   !!D365.ownerUserId,
   D365_OWNER_TEAM_ID:   !!D365.ownerTeamId,
   ELEVENLABS_WEBHOOK_SECRET: !!EL_WEBHOOK_SECRET,
+  SERVICENOW_INSTANCE_URL: !!SN.instanceUrl,
+  SERVICENOW_USER:         !!SN.user,
+  SERVICENOW_PASSWORD:     !!SN.password,
+  DOCUSIGN_BASE_URL:        !!DS.baseUrl,
+  DOCUSIGN_ACCOUNT_ID:      !!DS.accountId,
+  DOCUSIGN_INTEGRATION_KEY: !!DS.integrationKey,
+  DOCUSIGN_USER_ID:         !!DS.userId,
+  DOCUSIGN_PRIVATE_KEY:     !!DS.privateKey,
+  DOCUSIGN_NDA_TEMPLATE_ID: !!DS.ndaTemplateId,
 }));
 
 // The browser calls this to get a short-lived session token for the avatar.
@@ -203,6 +275,142 @@ app.post("/crm/lead", async (req, res) => {
   } catch (e) {
     console.error("[iris-crm] failed:", e.message);
     res.status(500).json({ status: "error", message: "CRM save failed." });
+  }
+});
+
+// ElevenLabs webhook tool "create_support_ticket" calls this before a live
+// escalation, so the ticket exists WITH context before any human handoff.
+app.post("/support/ticket", async (req, res) => {
+  if (req.headers["x-iris-secret"] !== D365.toolSecret) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const {
+    first_name, last_name, email, company,
+    issue_summary, urgency, conversation_id,
+  } = req.body || {};
+
+  if (!issue_summary) {
+    return res.status(400).json({ status: "invalid", message: "An issue summary is required." });
+  }
+
+  const contact = [
+    [first_name, last_name].filter(Boolean).join(" "),
+    email, company,
+  ].filter(Boolean).join(" | ") || "not provided";
+
+  const description =
+    `Escalated by Iris (AI assistant) on iristel.com — ${new Date().toISOString()}\n` +
+    `Contact: ${contact}\n` +
+    (conversation_id ? `Conversation: ${conversation_id}\n` : "") +
+    `\nISSUE\n${issue_summary}`;
+
+  // ServiceNow not wired yet -> queue mode: log everything, promise follow-up.
+  if (!SN.instanceUrl || !SN.user || !SN.password) {
+    console.log("[iris-sn] QUEUED (ServiceNow not configured):\n" + description);
+    return res.json({
+      status: "queued",
+      message: "The support request was recorded and the team will follow up by email.",
+    });
+  }
+
+  try {
+    const auth = Buffer.from(`${SN.user}:${SN.password}`).toString("base64");
+    const r = await fetch(`${SN.instanceUrl}/api/now/table/${SN.table}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "content-type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        short_description: `Iris escalation: ${issue_summary.slice(0, 120)}`,
+        description,
+        urgency: urgency === "high" ? "1" : urgency === "low" ? "3" : "2",
+        contact_type: "chat",
+      }),
+    });
+    const json = await r.json();
+    if (!r.ok) {
+      console.error("[iris-sn] create failed:", r.status, JSON.stringify(json));
+      return res.status(502).json({ status: "error", message: "Ticket creation failed." });
+    }
+    const number = json.result?.number;
+    console.log("[iris-sn] ticket created:", number, "conv:", conversation_id || "-");
+    res.json({
+      status: "created",
+      ticket_number: number,
+      message: `Support ticket ${number} was created. A specialist will follow up.`,
+    });
+  } catch (e) {
+    console.error("[iris-sn] failed:", e.message);
+    res.status(500).json({ status: "error", message: "Ticket creation failed." });
+  }
+});
+
+// ElevenLabs webhook tool "send_nda" calls this to email the partner NDA
+// for signature via DocuSign, gating partner/wholesale pricing.
+app.post("/nda/send", async (req, res) => {
+  if (req.headers["x-iris-secret"] !== D365.toolSecret) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const { first_name, last_name, email, company, conversation_id } = req.body || {};
+  if (!first_name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({
+      status: "invalid",
+      message: "A first name and a valid email address are required.",
+    });
+  }
+
+  const fullName = [first_name, last_name].filter(Boolean).join(" ");
+
+  // DocuSign not wired yet -> queue mode.
+  const dsMissing = !DS.baseUrl || !DS.accountId || !DS.integrationKey ||
+                    !DS.userId || !DS.privateKey || !DS.ndaTemplateId;
+  if (dsMissing) {
+    console.log("[iris-nda] QUEUED (DocuSign not configured):", fullName, email,
+      company || "-", "conv:", conversation_id || "-");
+    return res.json({
+      status: "queued",
+      message: "The NDA request was recorded — the team will send it by email shortly.",
+    });
+  }
+
+  try {
+    const token = await getDocuSignToken();
+    const r = await fetch(`${DS.baseUrl}/v2.1/accounts/${DS.accountId}/envelopes`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        templateId: DS.ndaTemplateId,
+        templateRoles: [{
+          roleName: "Signer",
+          name: fullName,
+          email,
+        }],
+        emailSubject: "Iristel Partner NDA for signature",
+        status: "sent", // sends the signing email immediately
+      }),
+    });
+    const json = await r.json();
+    if (!r.ok) {
+      console.error("[iris-nda] envelope failed:", r.status, JSON.stringify(json));
+      return res.status(502).json({ status: "error", message: "NDA sending failed." });
+    }
+    console.log("[iris-nda] envelope sent:", json.envelopeId, "to", email,
+      "conv:", conversation_id || "-");
+    res.json({
+      status: "sent",
+      message: `The NDA is on its way to ${email} for signature via DocuSign.`,
+    });
+  } catch (e) {
+    console.error("[iris-nda] failed:", e.message);
+    res.status(500).json({ status: "error", message: "NDA sending failed." });
   }
 });
 
