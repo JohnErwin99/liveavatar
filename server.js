@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
+import { readFileSync as fsReadFileSync } from "fs";
 
 const app = express();
 app.use(express.json({
@@ -60,15 +61,41 @@ const SN = {
 // Rebuild a valid PEM no matter how the env var was pasted (single line,
 // literal \n sequences, or spaces where newlines belong). PEM is just
 // "-----BEGIN X-----", base64 in 64-char lines, "-----END X-----".
+function loadPrivateKey() {
+  // Prefer a key file committed to the repo (robust — no env-var mangling).
+  // Set DOCUSIGN_PRIVATE_KEY_PATH=./docusign_private.key, or fall back to the
+  // env var. Either way the value is normalized into valid PEM.
+  const p = process.env.DOCUSIGN_PRIVATE_KEY_PATH;
+  if (p) {
+    try {
+      const fromFile = fsReadFileSync(p, "utf8");
+      if (fromFile && fromFile.trim()) return normalizePem(fromFile);
+      console.error("[docusign] key file empty:", p);
+    } catch (e) {
+      console.error("[docusign] key file read failed:", e.message);
+    }
+  }
+  return normalizePem(process.env.DOCUSIGN_PRIVATE_KEY || "");
+}
+
 function normalizePem(raw) {
   if (!raw) return "";
   let s = raw.replace(/\\n/g, "\n").trim();
   const m = s.match(/-----BEGIN ([A-Z0-9 ]+)-----([\s\S]*?)-----END \1-----/);
-  if (!m) return s; // no armor found — pass through and let crypto report it
-  const label = m[1];
-  const body = m[2].replace(/[^A-Za-z0-9+/=]/g, ""); // strip ALL whitespace/newlines
-  const lines = body.match(/.{1,64}/g) || [];
-  return `-----BEGIN ${label}-----\n${lines.join("\n")}\n-----END ${label}-----\n`;
+  if (m) {
+    const label = m[1];
+    const body = m[2].replace(/[^A-Za-z0-9+/=]/g, ""); // strip ALL whitespace/newlines
+    const lines = body.match(/.{1,64}/g) || [];
+    return `-----BEGIN ${label}-----\n${lines.join("\n")}\n-----END ${label}-----\n`;
+  }
+  // No armor found — if what's left looks like a bare base64 key body
+  // (the BEGIN/END lines got stripped on paste), wrap it as PKCS#1 RSA.
+  const bare = s.replace(/[^A-Za-z0-9+/=]/g, "");
+  if (bare.length > 500 && /^MII/.test(bare)) {
+    const lines = bare.match(/.{1,64}/g) || [];
+    return `-----BEGIN RSA PRIVATE KEY-----\n${lines.join("\n")}\n-----END RSA PRIVATE KEY-----\n`;
+  }
+  return s; // give crypto the raw value and let it report the problem
 }
 
 // ---- DocuSign (NDA sending) — JWT grant, no SDK needed.
@@ -81,7 +108,7 @@ const DS = {
   accountId:      process.env.DOCUSIGN_ACCOUNT_ID || "",
   integrationKey: process.env.DOCUSIGN_INTEGRATION_KEY || "",
   userId:         process.env.DOCUSIGN_USER_ID || "",
-  privateKey:     normalizePem(process.env.DOCUSIGN_PRIVATE_KEY || ""),
+  privateKey:     loadPrivateKey(),
   ndaTemplateId:  process.env.DOCUSIGN_NDA_TEMPLATE_ID || "",
 };
 
