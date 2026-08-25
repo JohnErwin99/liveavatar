@@ -244,17 +244,19 @@ app.post("/webhooks/elevenlabs", async (req, res) => {
     const convId = data.conversation_id;
     if (!convId) return;
 
-    // Build a readable transcript.
-    const lines = (data.transcript || [])
-      .filter(t => t && t.message)
-      .map(t => `${t.role === "agent" ? "Iris" : "Customer"}: ${t.message}`);
+    // Attach the AI-generated summary only — not the full transcript.
     const summary = data.analysis?.transcript_summary || "";
     const durationSecs = data.metadata?.call_duration_secs;
 
+    // Nothing worth attaching if there's no summary.
+    if (!summary) {
+      console.log("[iris-crm] webhook: no summary for conversation", convId, "— skipping note");
+      return;
+    }
+
     let noteText =
-      (summary ? `SUMMARY\n${summary}\n\n` : "") +
-      (durationSecs ? `Duration: ${Math.round(durationSecs / 60)} min ${durationSecs % 60} s\n\n` : "") +
-      `TRANSCRIPT\n` + lines.join("\n");
+      `SUMMARY\n${summary}` +
+      (durationSecs ? `\n\nDuration: ${Math.round(durationSecs / 60)} min ${durationSecs % 60} s` : "");
     // Annotation notetext is capped; keep a wide margin.
     if (noteText.length > 90000) noteText = noteText.slice(0, 90000) + "\n[truncated]";
 
