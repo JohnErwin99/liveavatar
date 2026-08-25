@@ -57,6 +57,20 @@ const SN = {
   table:       process.env.SERVICENOW_TABLE || "incident",
 };
 
+// Rebuild a valid PEM no matter how the env var was pasted (single line,
+// literal \n sequences, or spaces where newlines belong). PEM is just
+// "-----BEGIN X-----", base64 in 64-char lines, "-----END X-----".
+function normalizePem(raw) {
+  if (!raw) return "";
+  let s = raw.replace(/\\n/g, "\n").trim();
+  const m = s.match(/-----BEGIN ([A-Z0-9 ]+)-----([\s\S]*?)-----END \1-----/);
+  if (!m) return s; // no armor found — pass through and let crypto report it
+  const label = m[1];
+  const body = m[2].replace(/[^A-Za-z0-9+/=]/g, ""); // strip ALL whitespace/newlines
+  const lines = body.match(/.{1,64}/g) || [];
+  return `-----BEGIN ${label}-----\n${lines.join("\n")}\n-----END ${label}-----\n`;
+}
+
 // ---- DocuSign (NDA sending) — JWT grant, no SDK needed.
 // Setup once in DocuSign Admin: create an app (integration key), generate an
 // RSA keypair, grant consent for "signature impersonation", and build the NDA
@@ -67,7 +81,7 @@ const DS = {
   accountId:      process.env.DOCUSIGN_ACCOUNT_ID || "",
   integrationKey: process.env.DOCUSIGN_INTEGRATION_KEY || "",
   userId:         process.env.DOCUSIGN_USER_ID || "",
-  privateKey:     (process.env.DOCUSIGN_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+  privateKey:     normalizePem(process.env.DOCUSIGN_PRIVATE_KEY || ""),
   ndaTemplateId:  process.env.DOCUSIGN_NDA_TEMPLATE_ID || "",
 };
 
