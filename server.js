@@ -1,8 +1,11 @@
 import express from "express";
 import cors from "cors";
+import crypto from "crypto";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; }, // raw body kept for webhook HMAC checks
+}));
 
 // Allowed origins. If ALLOWED_ORIGIN is unset -> allow all. Otherwise allow the
 // listed origins PLUS any *.webflow.io subdomain (handy for staging).
@@ -32,7 +35,17 @@ const D365 = {
   clientSecret: process.env.D365_CLIENT_SECRET,
   orgUrl:       (process.env.D365_ORG_URL || "").replace(/\/+$/, ""), // e.g. https://yourorg-sandbox.crm3.dynamics.com
   toolSecret:   process.env.IRIS_TOOL_SECRET,                          // shared secret for the ElevenLabs webhook tool
+  // Optional lead routing. Set ONE of these (a GUID) to make new leads land
+  // in a real user's "My Open Leads" or a team's view instead of being owned
+  // by the application user:
+  //   D365_OWNER_USER_ID = systemuser GUID  (Settings > Users > user > copy id from URL)
+  //   D365_OWNER_TEAM_ID = team GUID
+  ownerUserId:  process.env.D365_OWNER_USER_ID || "",
+  ownerTeamId:  process.env.D365_OWNER_TEAM_ID || "",
 };
+
+// HMAC secret from ElevenLabs post-call webhook setup (Agents settings > Webhooks).
+const EL_WEBHOOK_SECRET = process.env.ELEVENLABS_WEBHOOK_SECRET || "";
 
 let d365Token = { value: null, exp: 0 };
 
@@ -72,6 +85,9 @@ app.get("/config", (_req, res) => res.json({
   D365_CLIENT_SECRET:   !!D365.clientSecret,
   D365_ORG_URL:         !!D365.orgUrl,
   IRIS_TOOL_SECRET:     !!D365.toolSecret,
+  D365_OWNER_USER_ID:   !!D365.ownerUserId,
+  D365_OWNER_TEAM_ID:   !!D365.ownerTeamId,
+  ELEVENLABS_WEBHOOK_SECRET: !!EL_WEBHOOK_SECRET,
 }));
 
 // The browser calls this to get a short-lived session token for the avatar.
@@ -124,7 +140,7 @@ app.post("/crm/lead", async (req, res) => {
     return res.status(401).json({ error: "unauthorized" });
   }
 
-  const { first_name, last_name, email, company, topic } = req.body || {};
+  const { first_name, last_name, email, company, topic, conversation_id } = req.body || {};
   if (!first_name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({
       status: "invalid",
@@ -157,13 +173,21 @@ app.post("/crm/lead", async (req, res) => {
         Prefer: "return=representation",
       },
       body: JSON.stringify({
+        // Route ownership if configured; otherwise the app user owns the lead
+        // (it will then appear in "All Leads" but NOT in anyone's "My Open Leads").
+        ...(D365.ownerUserId
+          ? { "ownerid@odata.bind": `/systemusers(${D365.ownerUserId})` }
+          : D365.ownerTeamId
+            ? { "ownerid@odata.bind": `/teams(${D365.ownerTeamId})` }
+            : {}),
         subject: topic ? `Website lead — ${topic}` : "Website lead — Iris AI assistant",
         firstname: first_name,
         lastname: last_name || "(not provided)",
         emailaddress1: email,
         ...(company ? { companyname: company } : {}),
         description: `Captured by Iris (AI assistant) on iristel.com — ${new Date().toISOString()}` +
-          (topic ? `\nTopic of interest: ${topic}` : ""),
+          (topic ? `\nTopic of interest: ${topic}` : "") +
+          (conversation_id ? `\n[conv:${conversation_id}]` : ""),
       }),
     });
 
@@ -179,6 +203,107 @@ app.post("/crm/lead", async (req, res) => {
   } catch (e) {
     console.error("[iris-crm] failed:", e.message);
     res.status(500).json({ status: "error", message: "CRM save failed." });
+  }
+});
+
+// ---- ElevenLabs post-call webhook: attach the transcript to the lead ----
+// Enable in ElevenLabs: Agents settings > Webhooks > post_call_transcription,
+// pointing at POST /webhooks/elevenlabs. Store the generated HMAC secret in
+// ELEVENLABS_WEBHOOK_SECRET.
+
+function verifyElevenLabsSignature(req) {
+  if (!EL_WEBHOOK_SECRET) return false;
+  const header = req.headers["elevenlabs-signature"];
+  if (!header || !req.rawBody) return false;
+  // Header format: t=<unix_ts>,v0=<hex hmac of "<t>.<raw body>">
+  const parts = Object.fromEntries(header.split(",").map(kv => kv.split("=")));
+  if (!parts.t || !parts.v0) return false;
+  // Reject stale deliveries (older than 30 minutes) to block replays.
+  if (Math.abs(Date.now() / 1000 - Number(parts.t)) > 1800) return false;
+  const expected = "v0=" + crypto
+    .createHmac("sha256", EL_WEBHOOK_SECRET)
+    .update(`${parts.t}.${req.rawBody}`)
+    .digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from("v0=" + parts.v0), Buffer.from(expected));
+  } catch { return false; }
+}
+
+app.post("/webhooks/elevenlabs", async (req, res) => {
+  if (!verifyElevenLabsSignature(req)) {
+    return res.status(401).json({ error: "invalid signature" });
+  }
+  // Ack fast — ElevenLabs disables webhooks that keep failing. Everything
+  // below is best-effort and must not affect the response.
+  res.json({ received: true });
+
+  try {
+    const { type, data } = req.body || {};
+    if (type !== "post_call_transcription" || !data) return;
+
+    const convId = data.conversation_id;
+    if (!convId) return;
+
+    // Build a readable transcript.
+    const lines = (data.transcript || [])
+      .filter(t => t && t.message)
+      .map(t => `${t.role === "agent" ? "Iris" : "Customer"}: ${t.message}`);
+    const summary = data.analysis?.transcript_summary || "";
+    const durationSecs = data.metadata?.call_duration_secs;
+
+    let noteText =
+      (summary ? `SUMMARY\n${summary}\n\n` : "") +
+      (durationSecs ? `Duration: ${Math.round(durationSecs / 60)} min ${durationSecs % 60} s\n\n` : "") +
+      `TRANSCRIPT\n` + lines.join("\n");
+    // Annotation notetext is capped; keep a wide margin.
+    if (noteText.length > 90000) noteText = noteText.slice(0, 90000) + "\n[truncated]";
+
+    const token = await getD365Token();
+    const api = `${D365.orgUrl}/api/data/v9.2`;
+
+    // Find the lead stamped with this conversation id.
+    const q = `${api}/leads?$select=leadid&$filter=contains(description,'[conv:${convId}]')&$top=1`;
+    const found = await (await fetch(q, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    })).json();
+
+    if (!found.value || !found.value.length) {
+      console.log("[iris-crm] webhook: no lead for conversation", convId);
+      return;
+    }
+    const leadId = found.value[0].leadid;
+
+    // Idempotency: retried webhook deliveries must not duplicate the note.
+    const dupQ = `${api}/annotations?$select=annotationid&$filter=_objectid_value eq ${leadId} and subject eq 'Iris conversation ${convId}'&$top=1`;
+    const dup = await (await fetch(dupQ, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    })).json();
+    if (dup.value && dup.value.length) {
+      console.log("[iris-crm] webhook: note already attached for", convId);
+      return;
+    }
+
+    const note = await fetch(`${api}/annotations`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        subject: `Iris conversation ${convId}`,
+        notetext: noteText,
+        "objectid_lead@odata.bind": `/leads(${leadId})`,
+      }),
+    });
+
+    if (!note.ok) {
+      console.error("[iris-crm] webhook: note create failed:", note.status, await note.text());
+      return;
+    }
+    console.log("[iris-crm] webhook: transcript attached to lead", leadId, "conv", convId);
+  } catch (e) {
+    console.error("[iris-crm] webhook processing failed:", e.message);
   }
 });
 
