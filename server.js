@@ -265,16 +265,26 @@ app.post("/crm/lead", async (req, res) => {
     const token = await getD365Token();
     const api = `${D365.orgUrl}/api/data/v9.2`;
 
-    // Dedupe: skip if an OPEN lead (statecode 0) already has this email.
+    // Returning customer? If an OPEN lead (statecode 0) already has this email,
+    // return their name so Iris can greet them by name instead of creating a dup.
     const safeEmail = email.replace(/'/g, "''");
-    const q = `${api}/leads?$select=leadid&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
+    const q = `${api}/leads?$select=leadid,firstname,lastname&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
     const dupRes = await fetch(q, {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
     });
     const dup = await dupRes.json();
     if (dupRes.ok && dup.value && dup.value.length) {
-      console.log("[iris-crm] duplicate open lead for", email);
-      return res.json({ status: "exists", message: "This visitor already has an open lead in the CRM." });
+      const existing = dup.value[0];
+      const knownFirst = existing.firstname || first_name;
+      const knownName = [existing.firstname, existing.lastname]
+        .filter(Boolean).filter(n => n !== "(not provided)").join(" ") || knownFirst;
+      console.log("[iris-crm] returning customer:", email, "->", knownName);
+      return res.json({
+        status: "exists",
+        first_name: knownFirst,
+        full_name: knownName,
+        message: `Returning customer — greet them warmly by name: ${knownFirst}.`,
+      });
     }
 
     const create = await fetch(`${api}/leads`, {
@@ -452,6 +462,65 @@ app.post("/nda/send", async (req, res) => {
   } catch (e) {
     console.error("[iris-nda] failed:", e.message);
     res.status(500).json({ status: "error", message: "NDA sending failed." });
+  }
+});
+
+// ElevenLabs webhook tool "check_nda_status" calls this to see whether a
+// customer's NDA has been signed, keyed by their email address.
+app.post("/nda/status", async (req, res) => {
+  if (req.headers["x-iris-secret"] !== D365.toolSecret) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const { email } = req.body || {};
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ status: "invalid", message: "A valid email address is required." });
+  }
+
+  const dsMissing = !DS.baseUrl || !DS.accountId || !DS.integrationKey || !DS.userId || !DS.privateKey;
+  if (dsMissing) {
+    console.log("[iris-nda] status check QUEUED (DocuSign not configured):", email);
+    return res.json({ status: "unknown", message: "Unable to check signature status right now." });
+  }
+
+  try {
+    const token = await getDocuSignToken();
+    // Search the last 90 days for envelopes whose recipient email matches.
+    const from = new Date(Date.now() - 90 * 864e5).toISOString().slice(0, 10);
+    const url = `${DS.baseUrl}/v2.1/accounts/${DS.accountId}/envelopes` +
+      `?from_date=${from}&search_text=${encodeURIComponent(email)}` +
+      `&include=recipients&order=desc&order_by=last_modified`;
+
+    const r = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    });
+    const json = await r.json();
+    if (!r.ok) {
+      console.error("[iris-nda] status search failed:", r.status, JSON.stringify(json));
+      return res.status(502).json({ status: "unknown", message: "Couldn't check signature status." });
+    }
+
+    const envelopes = json.envelopes || [];
+    if (!envelopes.length) {
+      return res.json({ status: "none", signed: false, message: "No NDA was found for this email — none has been sent yet." });
+    }
+
+    // Most recent envelope for this recipient.
+    const env = envelopes[0];
+    const signed = env.status === "completed";
+    console.log("[iris-nda] status for", email, "->", env.status);
+
+    res.json({
+      status: signed ? "signed" : "pending",
+      signed,
+      envelope_status: env.status, // completed | sent | delivered | declined | voided ...
+      message: signed
+        ? "The NDA is signed and complete — partner pricing can be shared."
+        : `The NDA has been sent but is not signed yet (currently: ${env.status}).`,
+    });
+  } catch (e) {
+    console.error("[iris-nda] status failed:", e.message);
+    res.status(500).json({ status: "unknown", message: "Couldn't check signature status." });
   }
 });
 
