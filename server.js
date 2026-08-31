@@ -7,6 +7,9 @@ const app = express();
 app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf; }, // raw body kept for webhook HMAC checks
 }));
+// Mailchimp webhooks are application/x-www-form-urlencoded with bracketed keys
+// (data[merges][FNAME]); extended:true parses those into nested objects.
+app.use(express.urlencoded({ extended: true }));
 
 // Allowed origins. If ALLOWED_ORIGIN is unset -> allow all. Otherwise allow the
 // listed origins PLUS any *.webflow.io subdomain (handy for staging).
@@ -47,6 +50,10 @@ const D365 = {
 
 // HMAC secret from ElevenLabs post-call webhook setup (Agents settings > Webhooks).
 const EL_WEBHOOK_SECRET = process.env.ELEVENLABS_WEBHOOK_SECRET || "";
+
+// ---- Mailchimp landing-page webhook. Mailchimp can't send custom headers,
+// so the secret rides in the URL: /webhooks/mailchimp?key=<MAILCHIMP_WEBHOOK_KEY>
+const MC_WEBHOOK_KEY = process.env.MAILCHIMP_WEBHOOK_KEY || "";
 
 // ---- ServiceNow (Ciprian's API) — leave unset until credentials arrive.
 // The /support/ticket endpoint runs in "queued" mode without them, so the
@@ -192,6 +199,7 @@ app.get("/config", (_req, res) => res.json({
   D365_OWNER_USER_ID:   !!D365.ownerUserId,
   D365_OWNER_TEAM_ID:   !!D365.ownerTeamId,
   ELEVENLABS_WEBHOOK_SECRET: !!EL_WEBHOOK_SECRET,
+  MAILCHIMP_WEBHOOK_KEY:     !!MC_WEBHOOK_KEY,
   SERVICENOW_INSTANCE_URL: !!SN.instanceUrl,
   SERVICENOW_USER:         !!SN.user,
   SERVICENOW_PASSWORD:     !!SN.password,
@@ -237,6 +245,60 @@ app.get("/avatar-session", async (_req, res) => {
 
 // ElevenLabs webhook tool "create_lead" calls this (server-to-server).
 // Guarded by the x-iris-secret header — NOT meant to be called from the browser.
+// Shared lead creation used by both Iris (/crm/lead) and the Mailchimp webhook.
+// Returns { status: "created" | "exists", ... } or throws.
+async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source }) {
+  const token = await getD365Token();
+  const api = `${D365.orgUrl}/api/data/v9.2`;
+
+  const safeEmail = email.replace(/'/g, "''");
+  const q = `${api}/leads?$select=leadid,firstname,lastname&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
+  const dupRes = await fetch(q, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+  const dup = await dupRes.json();
+  if (dupRes.ok && dup.value && dup.value.length) {
+    const existing = dup.value[0];
+    const knownFirst = existing.firstname || first_name;
+    const knownName = [existing.firstname, existing.lastname]
+      .filter(Boolean).filter(n => n !== "(not provided)").join(" ") || knownFirst;
+    return { status: "exists", first_name: knownFirst, full_name: knownName, leadid: existing.leadid };
+  }
+
+  const subject = source === "mailchimp"
+    ? `Landing page lead${topic ? ` — ${topic}` : ""}`
+    : (topic ? `Website lead — ${topic}` : "Website lead — Iris AI assistant");
+  const origin = source === "mailchimp"
+    ? "Captured from Mailchimp landing page"
+    : "Captured by Iris (AI assistant) on iristel.com";
+
+  const create = await fetch(`${api}/leads`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      Accept: "application/json",
+      Prefer: "return=representation",
+    },
+    body: JSON.stringify({
+      ...(D365.ownerUserId
+        ? { "ownerid@odata.bind": `/systemusers(${D365.ownerUserId})` }
+        : D365.ownerTeamId
+          ? { "ownerid@odata.bind": `/teams(${D365.ownerTeamId})` }
+          : {}),
+      subject,
+      firstname: first_name,
+      lastname: last_name || "(not provided)",
+      emailaddress1: email,
+      ...(company ? { companyname: company } : {}),
+      description: `${origin} — ${new Date().toISOString()}` +
+        (topic ? `\nTopic of interest: ${topic}` : "") +
+        (conversation_id ? `\n[conv:${conversation_id}]` : ""),
+    }),
+  });
+  if (!create.ok) throw new Error(`D365 create ${create.status}: ${await create.text()}`);
+  const lead = await create.json();
+  return { status: "created", leadid: lead.leadid };
+}
+
 app.post("/crm/lead", async (req, res) => {
   const missing = [];
   if (!D365.tenant)       missing.push("D365_TENANT_ID");
@@ -262,70 +324,61 @@ app.post("/crm/lead", async (req, res) => {
   }
 
   try {
-    const token = await getD365Token();
-    const api = `${D365.orgUrl}/api/data/v9.2`;
-
-    // Returning customer? If an OPEN lead (statecode 0) already has this email,
-    // return their name so Iris can greet them by name instead of creating a dup.
-    const safeEmail = email.replace(/'/g, "''");
-    const q = `${api}/leads?$select=leadid,firstname,lastname&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
-    const dupRes = await fetch(q, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-    });
-    const dup = await dupRes.json();
-    if (dupRes.ok && dup.value && dup.value.length) {
-      const existing = dup.value[0];
-      const knownFirst = existing.firstname || first_name;
-      const knownName = [existing.firstname, existing.lastname]
-        .filter(Boolean).filter(n => n !== "(not provided)").join(" ") || knownFirst;
-      console.log("[iris-crm] returning customer:", email, "->", knownName);
+    const r = await createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source: "iris" });
+    if (r.status === "exists") {
+      console.log("[iris-crm] returning customer:", email, "->", r.full_name);
       return res.json({
         status: "exists",
-        first_name: knownFirst,
-        full_name: knownName,
-        message: `Returning customer — greet them warmly by name: ${knownFirst}.`,
+        first_name: r.first_name,
+        full_name: r.full_name,
+        message: `Returning customer — greet them warmly by name: ${r.first_name}.`,
       });
     }
-
-    const create = await fetch(`${api}/leads`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-        Accept: "application/json",
-        Prefer: "return=representation",
-      },
-      body: JSON.stringify({
-        // Route ownership if configured; otherwise the app user owns the lead
-        // (it will then appear in "All Leads" but NOT in anyone's "My Open Leads").
-        ...(D365.ownerUserId
-          ? { "ownerid@odata.bind": `/systemusers(${D365.ownerUserId})` }
-          : D365.ownerTeamId
-            ? { "ownerid@odata.bind": `/teams(${D365.ownerTeamId})` }
-            : {}),
-        subject: topic ? `Website lead — ${topic}` : "Website lead — Iris AI assistant",
-        firstname: first_name,
-        lastname: last_name || "(not provided)",
-        emailaddress1: email,
-        ...(company ? { companyname: company } : {}),
-        description: `Captured by Iris (AI assistant) on iristel.com — ${new Date().toISOString()}` +
-          (topic ? `\nTopic of interest: ${topic}` : "") +
-          (conversation_id ? `\n[conv:${conversation_id}]` : ""),
-      }),
-    });
-
-    if (!create.ok) {
-      const errText = await create.text();
-      console.error("[iris-crm] create failed:", create.status, errText);
-      return res.status(502).json({ status: "error", message: "CRM save failed." });
-    }
-
-    const lead = await create.json();
-    console.log("[iris-crm] lead created:", lead.leadid, email);
+    console.log("[iris-crm] lead created:", r.leadid, email);
     res.json({ status: "created", message: "Lead saved successfully. A team member will follow up." });
   } catch (e) {
     console.error("[iris-crm] failed:", e.message);
     res.status(500).json({ status: "error", message: "CRM save failed." });
+  }
+});
+
+// Mailchimp audience webhook -> D365 lead. Fires on new landing-page signups.
+// Mailchimp probes the URL with GET during setup and expects 200.
+app.get("/webhooks/mailchimp", (_req, res) => res.status(200).send("ok"));
+app.post("/webhooks/mailchimp", async (req, res) => {
+  if (!MC_WEBHOOK_KEY || req.query.key !== MC_WEBHOOK_KEY) {
+    return res.status(401).send("unauthorized");
+  }
+  // Ack immediately — Mailchimp retries on non-200 and eventually disables.
+  res.status(200).send("ok");
+
+  try {
+    const type = req.body.type;
+    if (type !== "subscribe") { console.log("[iris-mc] ignoring event:", type); return; }
+
+    const d = req.body.data || {};
+    const m = d.merges || {};
+    const email = (d.email || m.EMAIL || "").trim();
+    if (!email) { console.warn("[iris-mc] subscribe event with no email"); return; }
+
+    // Field mapping: prefer FNAME/LNAME; fall back to a full-name field split.
+    let first_name = (m.FNAME || "").trim();
+    let last_name  = (m.LNAME || "").trim();
+    if (!first_name) {
+      const full = (m.NAME || m.FULLNAME || m.MMERGE1 || "").trim();
+      if (full) { const parts = full.split(/\s+/); first_name = parts.shift(); last_name = parts.join(" "); }
+    }
+    if (!first_name) first_name = email.split("@")[0]; // last resort — never drop a lead
+
+    const company = (m.COMPANY || m.MMERGE3 || "").trim();
+    const topic   = (m.INTEREST || m.TOPIC || m.MMERGE4 || "").trim();
+
+    const result = await createOrFindLead({
+      first_name, last_name, email, company, topic, source: "mailchimp",
+    });
+    console.log("[iris-mc]", result.status, email, "list:", d.list_id);
+  } catch (e) {
+    console.error("[iris-mc] failed:", e.message);
   }
 });
 
