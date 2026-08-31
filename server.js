@@ -353,6 +353,11 @@ app.post("/webhooks/mailchimp", async (req, res) => {
   res.status(200).send("ok");
 
   try {
+    // TEMPORARY: dump the exact payload so we can map checkbox/group fields.
+    // Remove this block once mapping is confirmed.
+    console.log("[iris-mc RAW body]:", JSON.stringify(req.body));
+    if (req.rawBody) console.log("[iris-mc RAW encoded]:", req.rawBody.toString());
+
     const type = req.body.type;
     if (type !== "subscribe") { console.log("[iris-mc] ignoring event:", type); return; }
 
@@ -679,9 +684,6 @@ app.post("/webhooks/elevenlabs", async (req, res) => {
     console.error("[iris-crm] webhook processing failed:", e.message);
   }
 });
-
-const PORT = process.env.PORT || 3000;   // Railway injects PORT automatically
-app.listen(PORT, () => console.log("LiveAvatar token server listening on", PORT));
 
 const PORT = process.env.PORT || 3000;   // Railway injects PORT automatically
 app.listen(PORT, () => console.log("LiveAvatar token server listening on", PORT));
