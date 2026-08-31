@@ -264,7 +264,7 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
   }
 
   const subject = source === "mailchimp"
-    ? `Landing page lead${topic ? ` — ${topic}` : ""}`
+    ? `Golf Lead${topic ? ` — ${topic}` : ""}`
     : (topic ? `Website lead — ${topic}` : "Website lead — Iris AI assistant");
   const origin = source === "mailchimp"
     ? "Captured from Mailchimp landing page"
@@ -679,6 +679,9 @@ app.post("/webhooks/elevenlabs", async (req, res) => {
     console.error("[iris-crm] webhook processing failed:", e.message);
   }
 });
+
+const PORT = process.env.PORT || 3000;   // Railway injects PORT automatically
+app.listen(PORT, () => console.log("LiveAvatar token server listening on", PORT));
 
 const PORT = process.env.PORT || 3000;   // Railway injects PORT automatically
 app.listen(PORT, () => console.log("LiveAvatar token server listening on", PORT));
