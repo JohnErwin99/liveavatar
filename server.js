@@ -247,7 +247,7 @@ app.get("/avatar-session", async (_req, res) => {
 // Guarded by the x-iris-secret header — NOT meant to be called from the browser.
 // Shared lead creation used by both Iris (/crm/lead) and the Mailchimp webhook.
 // Returns { status: "created" | "exists", ... } or throws.
-async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source }) {
+async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details }) {
   const token = await getD365Token();
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
@@ -291,6 +291,7 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
       ...(company ? { companyname: company } : {}),
       description: `${origin} — ${new Date().toISOString()}` +
         (topic ? `\nTopic of interest: ${topic}` : "") +
+        (details && details.length ? `\n\nFORM ANSWERS\n${details.join("\n")}` : "") +
         (conversation_id ? `\n[conv:${conversation_id}]` : ""),
     }),
   });
@@ -353,11 +354,6 @@ app.post("/webhooks/mailchimp", async (req, res) => {
   res.status(200).send("ok");
 
   try {
-    // TEMPORARY: dump the exact payload so we can map checkbox/group fields.
-    // Remove this block once mapping is confirmed.
-    console.log("[iris-mc RAW body]:", JSON.stringify(req.body));
-    if (req.rawBody) console.log("[iris-mc RAW encoded]:", req.rawBody.toString());
-
     const type = req.body.type;
     if (type !== "subscribe") { console.log("[iris-mc] ignoring event:", type); return; }
 
@@ -376,12 +372,37 @@ app.post("/webhooks/mailchimp", async (req, res) => {
     if (!first_name) first_name = email.split("@")[0]; // last resort — never drop a lead
 
     const company = (m.COMPANY || m.MMERGE3 || "").trim();
-    const topic   = (m.INTEREST || m.TOPIC || m.MMERGE4 || "").trim();
+
+    // Checkbox/radio answers arrive as GROUPINGS: [{ name, groups: "A, B" }, ...]
+    const groupings = Array.isArray(m.GROUPINGS) ? m.GROUPINGS : [];
+    const answered = groupings
+      .map(g => ({ name: (g.name || "").trim(), groups: (g.groups || "").trim() }))
+      .filter(g => g.name && g.groups);
+
+    // Topic priority: explicit TOPIC/INTEREST merge field, then the product-interest
+    // question, then the challenge question, then the first answered group.
+    const byName = (frag) => answered.find(g => g.name.toLowerCase().includes(frag));
+    const topic =
+      (m.TOPIC || m.INTEREST || "").trim() ||
+      (byName("product")?.groups) ||
+      (byName("challenge")?.groups) ||
+      (answered[0]?.groups) || "";
+
+    // Description details: every answered group question, plus any non-empty
+    // merge field we don't already map elsewhere. New form fields flow through
+    // automatically — no code change needed when the form evolves.
+    const SKIP = new Set(["EMAIL", "FNAME", "LNAME", "COMPANY", "GROUPINGS", "INTERESTS", "TOPIC"]);
+    const details = [
+      ...answered.map(g => `${g.name}: ${g.groups}`),
+      ...Object.entries(m)
+        .filter(([k, v]) => !SKIP.has(k) && typeof v === "string" && v.trim())
+        .map(([k, v]) => `${k}: ${v.trim()}`),
+    ];
 
     const result = await createOrFindLead({
-      first_name, last_name, email, company, topic, source: "mailchimp",
+      first_name, last_name, email, company, topic, source: "mailchimp", details,
     });
-    console.log("[iris-mc]", result.status, email, "list:", d.list_id);
+    console.log("[iris-mc]", result.status, email, "topic:", topic || "-", "details:", details.length);
   } catch (e) {
     console.error("[iris-mc] failed:", e.message);
   }
