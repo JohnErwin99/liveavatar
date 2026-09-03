@@ -253,7 +253,7 @@ async function createOrFindLead({ first_name, last_name, email, phone, company, 
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
   const safeEmail = email.replace(/'/g, "''");
-  const q = `${api}/leads?$select=leadid,firstname,lastname&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
+  const q = `${api}/leads?$select=leadid,firstname,lastname,telephone1,companyname&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
   const dupRes = await fetch(q, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
   const dup = await dupRes.json();
   if (dupRes.ok && dup.value && dup.value.length) {
@@ -261,7 +261,13 @@ async function createOrFindLead({ first_name, last_name, email, phone, company, 
     const knownFirst = existing.firstname || first_name;
     const knownName = [existing.firstname, existing.lastname]
       .filter(Boolean).filter(n => n !== "(not provided)").join(" ") || knownFirst;
-    return { status: "exists", first_name: knownFirst, full_name: knownName, leadid: existing.leadid };
+    return {
+      status: "exists",
+      first_name: knownFirst,
+      full_name: knownName,
+      leadid: existing.leadid,
+      existing, // raw fields so callers can backfill blanks
+    };
   }
 
   const subject = source === "mailchimp"
@@ -389,9 +395,36 @@ app.post("/crm/website-lead", async (req, res) => {
     });
 
     if (r.status === "exists") {
-      // Existing open lead: attach the new interest as a note instead of duplicating.
+      // Existing open lead: backfill ONLY empty contact fields (never overwrite
+      // what sales may have corrected), then attach the new interest as a note.
       try {
         const token = await getD365Token();
+
+        const ex = r.existing || {};
+        const isBlank = (v) => !v || !String(v).trim() || v === "(not provided)";
+        const patch = {};
+        if (isBlank(ex.firstname)   && clip(first_name, 60)) patch.firstname   = clip(first_name, 60);
+        if (isBlank(ex.lastname)    && clip(last_name, 60))  patch.lastname    = clip(last_name, 60);
+        if (isBlank(ex.telephone1)  && clip(phone, 40))      patch.telephone1  = clip(phone, 40);
+        if (isBlank(ex.companyname) && clip(company, 120))   patch.companyname = clip(company, 120);
+
+        if (Object.keys(patch).length) {
+          const upd = await fetch(`${D365.orgUrl}/api/data/v9.2/leads(${r.leadid})`, {
+            method: "PATCH",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+              Accept: "application/json",
+              "If-Match": "*", // update only; never create via upsert
+            },
+            body: JSON.stringify(patch),
+          });
+          if (upd.ok) {
+            console.log("[iris-web] backfilled fields on lead", r.leadid, ":", Object.keys(patch).join(", "));
+          } else {
+            console.error("[iris-web] backfill failed:", upd.status, await upd.text());
+          }
+        }
         await fetch(`${D365.orgUrl}/api/data/v9.2/annotations`, {
           method: "POST",
           headers: {
