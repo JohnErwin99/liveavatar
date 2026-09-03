@@ -181,7 +181,7 @@ async function getD365Token() {
 }
 
 app.get("/", (_req, res) =>
-  res.json({ service: "iris-liveavatar-backend", status: "up", endpoints: ["/health", "/avatar-session", "/crm/lead"] }));
+  res.json({ service: "iris-liveavatar-backend", status: "up", endpoints: ["/health", "/avatar-session", "/crm/lead", "/crm/website-lead"] }));
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -245,9 +245,10 @@ app.get("/avatar-session", async (_req, res) => {
 
 // ElevenLabs webhook tool "create_lead" calls this (server-to-server).
 // Guarded by the x-iris-secret header — NOT meant to be called from the browser.
-// Shared lead creation used by both Iris (/crm/lead) and the Mailchimp webhook.
+// Shared lead creation used by Iris (/crm/lead), the Mailchimp webhook, and
+// the pricing-page form (/crm/website-lead).
 // Returns { status: "created" | "exists", ... } or throws.
-async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details }) {
+async function createOrFindLead({ first_name, last_name, email, phone, company, topic, conversation_id, source, details }) {
   const token = await getD365Token();
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
@@ -268,7 +269,9 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
     : (topic ? `Website lead — ${topic}` : "Website lead — Iris AI assistant");
   const origin = source === "mailchimp"
     ? "Captured from Mailchimp landing page"
-    : "Captured by Iris (AI assistant) on iristel.com";
+    : source === "website-form"
+      ? "Captured from iristel.com pricing page form"
+      : "Captured by Iris (AI assistant) on iristel.com";
 
   const create = await fetch(`${api}/leads`, {
     method: "POST",
@@ -288,6 +291,7 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
       firstname: first_name,
       lastname: last_name || "(not provided)",
       emailaddress1: email,
+      ...(phone ? { telephone1: phone } : {}),
       ...(company ? { companyname: company } : {}),
       description: `${origin} — ${new Date().toISOString()}` +
         (topic ? `\nTopic of interest: ${topic}` : "") +
@@ -340,6 +344,81 @@ app.post("/crm/lead", async (req, res) => {
   } catch (e) {
     console.error("[iris-crm] failed:", e.message);
     res.status(500).json({ status: "error", message: "CRM save failed." });
+  }
+});
+
+// Pricing-page form on iristel.com posts here (browser-to-server, protected by
+// CORS allowlist — no shared secret, since the browser can't keep one).
+// Creates a D365 lead with subject "Website lead — <product>".
+app.post("/crm/website-lead", async (req, res) => {
+  const missing = [];
+  if (!D365.tenant)       missing.push("D365_TENANT_ID");
+  if (!D365.clientId)     missing.push("D365_CLIENT_ID");
+  if (!D365.clientSecret) missing.push("D365_CLIENT_SECRET");
+  if (!D365.orgUrl)       missing.push("D365_ORG_URL");
+  if (missing.length) {
+    return res.status(500).json({ error: "Missing env vars", missing });
+  }
+
+  const { first_name, last_name, email, phone, company, product, message } = req.body || {};
+
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ status: "invalid", message: "A valid email address is required." });
+  }
+  if (!product || typeof product !== "string" || !product.trim()) {
+    return res.status(400).json({ status: "invalid", message: "A product selection is required." });
+  }
+
+  // Cap free-text lengths so the description stays sane.
+  const clip = (v, n) => (typeof v === "string" ? v.trim().slice(0, n) : "");
+  const details = [
+    phone   ? `Phone: ${clip(phone, 40)}` : null,
+    message ? `Message: ${clip(message, 2000)}` : null,
+  ].filter(Boolean);
+
+  try {
+    const r = await createOrFindLead({
+      first_name: clip(first_name, 60) || email.split("@")[0],
+      last_name:  clip(last_name, 60),
+      email:      email.trim(),
+      phone:      clip(phone, 40),
+      company:    clip(company, 120),
+      topic:      clip(product, 120),           // -> subject: "Website lead — <product>"
+      source:     "website-form",
+      details,
+    });
+
+    if (r.status === "exists") {
+      // Existing open lead: attach the new interest as a note instead of duplicating.
+      try {
+        const token = await getD365Token();
+        await fetch(`${D365.orgUrl}/api/data/v9.2/annotations`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify({
+            subject: `Website lead — ${clip(product, 120)}`,
+            notetext: `Repeat pricing-page inquiry — ${new Date().toISOString()}\n` +
+              `Product of interest: ${clip(product, 120)}` +
+              (details.length ? `\n${details.join("\n")}` : ""),
+            "objectid_lead@odata.bind": `/leads(${r.leadid})`,
+          }),
+        });
+        console.log("[iris-web] existing lead, note attached:", r.leadid, email);
+      } catch (e) {
+        console.error("[iris-web] note attach failed:", e.message);
+      }
+      return res.json({ status: "exists", message: "Thanks! We have your info — a team member will follow up." });
+    }
+
+    console.log("[iris-web] lead created:", r.leadid, email, "product:", product);
+    res.json({ status: "created", message: "Thanks! A team member will follow up shortly." });
+  } catch (e) {
+    console.error("[iris-web] failed:", e.message);
+    res.status(500).json({ status: "error", message: "Something went wrong — please try again." });
   }
 });
 
