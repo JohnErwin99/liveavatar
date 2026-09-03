@@ -395,20 +395,25 @@ app.post("/crm/website-lead", async (req, res) => {
     });
 
     if (r.status === "exists") {
-      // Existing open lead: backfill ONLY empty contact fields (never overwrite
-      // what sales may have corrected), then attach the new interest as a note.
+      // Existing open lead: update contact fields with whatever the visitor
+      // provided this time (latest submission wins), then attach the new
+      // interest as a note. Blank form fields never erase existing CRM data.
       try {
         const token = await getD365Token();
 
-        const ex = r.existing || {};
-        const isBlank = (v) => !v || !String(v).trim() || v === "(not provided)";
-        const patch = {};
-        if (isBlank(ex.firstname)   && clip(first_name, 60)) patch.firstname   = clip(first_name, 60);
-        if (isBlank(ex.lastname)    && clip(last_name, 60))  patch.lastname    = clip(last_name, 60);
-        if (isBlank(ex.telephone1)  && clip(phone, 40))      patch.telephone1  = clip(phone, 40);
-        if (isBlank(ex.companyname) && clip(company, 120))   patch.companyname = clip(company, 120);
+        const patch = {
+          // Always refresh the subject to the latest inquiry — this both makes
+          // the row read as the newest interest AND guarantees a PATCH happens,
+          // which bumps modifiedon so the lead floats to the top of any view
+          // sorted by "Modified On". (createdon is immutable in D365.)
+          subject: `Website lead — ${clip(product, 120)}`,
+        };
+        if (clip(first_name, 60)) patch.firstname   = clip(first_name, 60);
+        if (clip(last_name, 60))  patch.lastname    = clip(last_name, 60);
+        if (clip(phone, 40))      patch.telephone1  = clip(phone, 40);
+        if (clip(company, 120))   patch.companyname = clip(company, 120);
 
-        if (Object.keys(patch).length) {
+        {
           const upd = await fetch(`${D365.orgUrl}/api/data/v9.2/leads(${r.leadid})`, {
             method: "PATCH",
             headers: {
@@ -420,9 +425,9 @@ app.post("/crm/website-lead", async (req, res) => {
             body: JSON.stringify(patch),
           });
           if (upd.ok) {
-            console.log("[iris-web] backfilled fields on lead", r.leadid, ":", Object.keys(patch).join(", "));
+            console.log("[iris-web] updated fields on lead", r.leadid, ":", Object.keys(patch).join(", "));
           } else {
-            console.error("[iris-web] backfill failed:", upd.status, await upd.text());
+            console.error("[iris-web] update failed:", upd.status, await upd.text());
           }
         }
         await fetch(`${D365.orgUrl}/api/data/v9.2/annotations`, {
