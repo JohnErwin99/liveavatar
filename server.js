@@ -250,15 +250,59 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
   const safeEmail = email.replace(/'/g, "''");
-  const q = `${api}/leads?$select=leadid,firstname,lastname&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
+  const q = `${api}/leads?$select=leadid,firstname,lastname,telephone1,companyname,cr57d_topicofinterest,cr57d_formanswers,cr57d_conversationid&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
   const dupRes = await fetch(q, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
   const dup = await dupRes.json();
   if (dupRes.ok && dup.value && dup.value.length) {
     const existing = dup.value[0];
-    const knownFirst = existing.firstname || first_name;
-    const knownName = [existing.firstname, existing.lastname]
+
+    // Refresh the lead with anything new from this submission. Only fill or
+    // correct — never blank out a field because the new submission omitted it.
+    const patch = {};
+    const isPlaceholder = (v) => !v || v === "(not provided)";
+    if (first_name && first_name !== existing.firstname) patch.firstname = first_name;
+    if (last_name && (isPlaceholder(existing.lastname) || last_name !== existing.lastname)) patch.lastname = last_name;
+    if (phone && String(phone).trim() && String(phone).trim() !== existing.telephone1) patch.telephone1 = String(phone).trim();
+    if (company && company !== existing.companyname) patch.companyname = company;
+    if (topic && topic !== existing.cr57d_topicofinterest) patch.cr57d_topicofinterest = topic.slice(0, 250);
+    // Point the lead at the LATEST conversation so the post-call webhook can
+    // attach this call's summary (it matches on cr57d_conversationid).
+    if (conversation_id && conversation_id !== existing.cr57d_conversationid) {
+      patch.cr57d_conversationid = conversation_id;
+    }
+    // Always leave a stamped trace of the repeat contact in the answers history.
+    const traceLines = [...(details || [])];
+    if (conversation_id && conversation_id !== existing.cr57d_conversationid) {
+      traceLines.push(`New conversation: ${conversation_id}`);
+    }
+    if (topic && topic !== existing.cr57d_topicofinterest) {
+      traceLines.push(`Topic: ${topic}`);
+    }
+    if (traceLines.length) {
+      const stamp = `--- ${source} ${new Date().toISOString().slice(0, 16)} ---`;
+      const prev = existing.cr57d_formanswers ? existing.cr57d_formanswers + "\n\n" : "";
+      patch.cr57d_formanswers = (prev + stamp + "\n" + traceLines.join("\n")).slice(-4000);
+    }
+
+    if (Object.keys(patch).length) {
+      const up = await fetch(`${api}/leads(${existing.leadid})`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          Accept: "application/json",
+          "If-Match": "*",
+        },
+        body: JSON.stringify(patch),
+      });
+      if (!up.ok) console.error("[iris-crm] lead update failed:", up.status, await up.text());
+      else console.log("[iris-crm] lead updated:", existing.leadid, "fields:", Object.keys(patch).join(","));
+    }
+
+    const knownFirst = patch.firstname || existing.firstname || first_name;
+    const knownName = [patch.firstname || existing.firstname, patch.lastname || existing.lastname]
       .filter(Boolean).filter(n => n !== "(not provided)").join(" ") || knownFirst;
-    return { status: "exists", first_name: knownFirst, full_name: knownName, leadid: existing.leadid };
+    return { status: "exists", first_name: knownFirst, full_name: knownName, leadid: existing.leadid, updated: Object.keys(patch) };
   }
 
   const subject = source === "mailchimp"
