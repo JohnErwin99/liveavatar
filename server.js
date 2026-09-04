@@ -305,12 +305,14 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
     return { status: "exists", first_name: knownFirst, full_name: knownName, leadid: existing.leadid, updated: Object.keys(patch) };
   }
 
-  const subject = source === "mailchimp"
-    ? `Golf Lead${topic ? ` — ${topic}` : ""}`
-    : (topic ? `Website lead — ${topic}` : "Website lead — Iris AI assistant");
-  const origin = source === "mailchimp"
-    ? "Captured from Mailchimp landing page"
-    : "Captured by Iris (AI assistant) on iristel.com";
+  const subject =
+    source === "mailchimp" ? `Golf Lead${topic ? ` — ${topic}` : ""}` :
+    source === "website-form" ? `Website Lead${topic ? ` — ${topic}` : ""}` :
+    `Iris Lead${topic ? ` — ${topic}` : ""}`;
+  const origin =
+    source === "mailchimp" ? "Captured from Mailchimp landing page" :
+    source === "website-form" ? "Captured from website pricing form" :
+    "Captured by Iris (AI assistant) on iristel.com";
 
   const create = await fetch(`${api}/leads`, {
     method: "POST",
