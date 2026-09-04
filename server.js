@@ -60,8 +60,7 @@ const MC_WEBHOOK_KEY = process.env.MAILCHIMP_WEBHOOK_KEY || "";
 // agent flow can ship first and light up when the integration is ready.
 const SN = {
   instanceUrl: (process.env.SERVICENOW_INSTANCE_URL || "").replace(/\/+$/, ""),
-  user:        process.env.SERVICENOW_USER || "",
-  password:    process.env.SERVICENOW_PASSWORD || "",
+  apiKey:      process.env.SERVICENOW_API_KEY || "",   // sent as x-sn-apikey header
   table:       process.env.SERVICENOW_TABLE || "incident",
 };
 
@@ -181,7 +180,7 @@ async function getD365Token() {
 }
 
 app.get("/", (_req, res) =>
-  res.json({ service: "iris-liveavatar-backend", status: "up", endpoints: ["/health", "/avatar-session", "/crm/lead", "/crm/website-lead"] }));
+  res.json({ service: "iris-liveavatar-backend", status: "up", endpoints: ["/health", "/avatar-session", "/crm/lead"] }));
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -201,8 +200,7 @@ app.get("/config", (_req, res) => res.json({
   ELEVENLABS_WEBHOOK_SECRET: !!EL_WEBHOOK_SECRET,
   MAILCHIMP_WEBHOOK_KEY:     !!MC_WEBHOOK_KEY,
   SERVICENOW_INSTANCE_URL: !!SN.instanceUrl,
-  SERVICENOW_USER:         !!SN.user,
-  SERVICENOW_PASSWORD:     !!SN.password,
+  SERVICENOW_API_KEY:      !!SN.apiKey,
   DOCUSIGN_BASE_URL:        !!DS.baseUrl,
   DOCUSIGN_ACCOUNT_ID:      !!DS.accountId,
   DOCUSIGN_INTEGRATION_KEY: !!DS.integrationKey,
@@ -245,15 +243,14 @@ app.get("/avatar-session", async (_req, res) => {
 
 // ElevenLabs webhook tool "create_lead" calls this (server-to-server).
 // Guarded by the x-iris-secret header — NOT meant to be called from the browser.
-// Shared lead creation used by Iris (/crm/lead), the Mailchimp webhook, and
-// the pricing-page form (/crm/website-lead).
+// Shared lead creation used by both Iris (/crm/lead) and the Mailchimp webhook.
 // Returns { status: "created" | "exists", ... } or throws.
-async function createOrFindLead({ first_name, last_name, email, phone, company, topic, conversation_id, source, details }) {
+async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details }) {
   const token = await getD365Token();
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
   const safeEmail = email.replace(/'/g, "''");
-  const q = `${api}/leads?$select=leadid,firstname,lastname,telephone1,companyname&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
+  const q = `${api}/leads?$select=leadid,firstname,lastname&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
   const dupRes = await fetch(q, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
   const dup = await dupRes.json();
   if (dupRes.ok && dup.value && dup.value.length) {
@@ -261,13 +258,7 @@ async function createOrFindLead({ first_name, last_name, email, phone, company, 
     const knownFirst = existing.firstname || first_name;
     const knownName = [existing.firstname, existing.lastname]
       .filter(Boolean).filter(n => n !== "(not provided)").join(" ") || knownFirst;
-    return {
-      status: "exists",
-      first_name: knownFirst,
-      full_name: knownName,
-      leadid: existing.leadid,
-      existing, // raw fields so callers can backfill blanks
-    };
+    return { status: "exists", first_name: knownFirst, full_name: knownName, leadid: existing.leadid };
   }
 
   const subject = source === "mailchimp"
@@ -275,9 +266,7 @@ async function createOrFindLead({ first_name, last_name, email, phone, company, 
     : (topic ? `Website lead — ${topic}` : "Website lead — Iris AI assistant");
   const origin = source === "mailchimp"
     ? "Captured from Mailchimp landing page"
-    : source === "website-form"
-      ? "Captured from iristel.com pricing page form"
-      : "Captured by Iris (AI assistant) on iristel.com";
+    : "Captured by Iris (AI assistant) on iristel.com";
 
   const create = await fetch(`${api}/leads`, {
     method: "POST",
@@ -294,15 +283,20 @@ async function createOrFindLead({ first_name, last_name, email, phone, company, 
           ? { "ownerid@odata.bind": `/teams(${D365.ownerTeamId})` }
           : {}),
       subject,
+      // Lead Source: Advertisement (1) for Mailchimp landing pages, Web (8) for Iris.
+      leadsourcecode: source === "mailchimp" ? 1 : 8,
       firstname: first_name,
       lastname: last_name || "(not provided)",
       emailaddress1: email,
-      ...(phone ? { telephone1: phone } : {}),
       ...(company ? { companyname: company } : {}),
-      description: `${origin} — ${new Date().toISOString()}` +
-        (topic ? `\nTopic of interest: ${topic}` : "") +
-        (details && details.length ? `\n\nFORM ANSWERS\n${details.join("\n")}` : "") +
-        (conversation_id ? `\n[conv:${conversation_id}]` : ""),
+      description: `${origin} — ${new Date().toISOString()}`,
+      // Structured custom fields (replaces jamming everything into description).
+      cr57d_leadsourcedetail: source,                               // "iris" | "mailchimp" | ...
+      ...(topic ? { cr57d_topicofinterest: topic.slice(0, 250) } : {}),
+      ...(conversation_id ? { cr57d_conversationid: conversation_id } : {}),
+      ...(details && details.length
+        ? { cr57d_formanswers: details.join("\n").slice(0, 4000) } : {}),
+      cr57d_capturedon: new Date().toISOString(),
     }),
   });
   if (!create.ok) throw new Error(`D365 create ${create.status}: ${await create.text()}`);
@@ -350,113 +344,6 @@ app.post("/crm/lead", async (req, res) => {
   } catch (e) {
     console.error("[iris-crm] failed:", e.message);
     res.status(500).json({ status: "error", message: "CRM save failed." });
-  }
-});
-
-// Pricing-page form on iristel.com posts here (browser-to-server, protected by
-// CORS allowlist — no shared secret, since the browser can't keep one).
-// Creates a D365 lead with subject "Website lead — <product>".
-app.post("/crm/website-lead", async (req, res) => {
-  const missing = [];
-  if (!D365.tenant)       missing.push("D365_TENANT_ID");
-  if (!D365.clientId)     missing.push("D365_CLIENT_ID");
-  if (!D365.clientSecret) missing.push("D365_CLIENT_SECRET");
-  if (!D365.orgUrl)       missing.push("D365_ORG_URL");
-  if (missing.length) {
-    return res.status(500).json({ error: "Missing env vars", missing });
-  }
-
-  const { first_name, last_name, email, phone, company, product, message } = req.body || {};
-
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ status: "invalid", message: "A valid email address is required." });
-  }
-  if (!product || typeof product !== "string" || !product.trim()) {
-    return res.status(400).json({ status: "invalid", message: "A product selection is required." });
-  }
-
-  // Cap free-text lengths so the description stays sane.
-  const clip = (v, n) => (typeof v === "string" ? v.trim().slice(0, n) : "");
-  const details = [
-    phone   ? `Phone: ${clip(phone, 40)}` : null,
-    message ? `Message: ${clip(message, 2000)}` : null,
-  ].filter(Boolean);
-
-  try {
-    const r = await createOrFindLead({
-      first_name: clip(first_name, 60) || email.split("@")[0],
-      last_name:  clip(last_name, 60),
-      email:      email.trim(),
-      phone:      clip(phone, 40),
-      company:    clip(company, 120),
-      topic:      clip(product, 120),           // -> subject: "Website lead — <product>"
-      source:     "website-form",
-      details,
-    });
-
-    if (r.status === "exists") {
-      // Existing open lead: update contact fields with whatever the visitor
-      // provided this time (latest submission wins), then attach the new
-      // interest as a note. Blank form fields never erase existing CRM data.
-      try {
-        const token = await getD365Token();
-
-        const patch = {
-          // Always refresh the subject to the latest inquiry — this both makes
-          // the row read as the newest interest AND guarantees a PATCH happens,
-          // which bumps modifiedon so the lead floats to the top of any view
-          // sorted by "Modified On". (createdon is immutable in D365.)
-          subject: `Website lead — ${clip(product, 120)}`,
-        };
-        if (clip(first_name, 60)) patch.firstname   = clip(first_name, 60);
-        if (clip(last_name, 60))  patch.lastname    = clip(last_name, 60);
-        if (clip(phone, 40))      patch.telephone1  = clip(phone, 40);
-        if (clip(company, 120))   patch.companyname = clip(company, 120);
-
-        {
-          const upd = await fetch(`${D365.orgUrl}/api/data/v9.2/leads(${r.leadid})`, {
-            method: "PATCH",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "content-type": "application/json",
-              Accept: "application/json",
-              "If-Match": "*", // update only; never create via upsert
-            },
-            body: JSON.stringify(patch),
-          });
-          if (upd.ok) {
-            console.log("[iris-web] updated fields on lead", r.leadid, ":", Object.keys(patch).join(", "));
-          } else {
-            console.error("[iris-web] update failed:", upd.status, await upd.text());
-          }
-        }
-        await fetch(`${D365.orgUrl}/api/data/v9.2/annotations`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "content-type": "application/json",
-            Accept: "application/json",
-          },
-          body: JSON.stringify({
-            subject: `Website lead — ${clip(product, 120)}`,
-            notetext: `Repeat pricing-page inquiry — ${new Date().toISOString()}\n` +
-              `Product of interest: ${clip(product, 120)}` +
-              (details.length ? `\n${details.join("\n")}` : ""),
-            "objectid_lead@odata.bind": `/leads(${r.leadid})`,
-          }),
-        });
-        console.log("[iris-web] existing lead, note attached:", r.leadid, email);
-      } catch (e) {
-        console.error("[iris-web] note attach failed:", e.message);
-      }
-      return res.json({ status: "exists", message: "Thanks! We have your info — a team member will follow up." });
-    }
-
-    console.log("[iris-web] lead created:", r.leadid, email, "product:", product);
-    res.json({ status: "created", message: "Thanks! A team member will follow up shortly." });
-  } catch (e) {
-    console.error("[iris-web] failed:", e.message);
-    res.status(500).json({ status: "error", message: "Something went wrong — please try again." });
   }
 });
 
@@ -553,7 +440,7 @@ app.post("/support/ticket", async (req, res) => {
     `\nISSUE\n${issue_summary}`;
 
   // ServiceNow not wired yet -> queue mode: log everything, promise follow-up.
-  if (!SN.instanceUrl || !SN.user || !SN.password) {
+  if (!SN.instanceUrl || !SN.apiKey) {
     console.log("[iris-sn] QUEUED (ServiceNow not configured):\n" + description);
     return res.json({
       status: "queued",
@@ -562,11 +449,10 @@ app.post("/support/ticket", async (req, res) => {
   }
 
   try {
-    const auth = Buffer.from(`${SN.user}:${SN.password}`).toString("base64");
     const r = await fetch(`${SN.instanceUrl}/api/now/table/${SN.table}`, {
       method: "POST",
       headers: {
-        Authorization: `Basic ${auth}`,
+        "x-sn-apikey": SN.apiKey,
         "content-type": "application/json",
         Accept: "application/json",
       },
@@ -778,7 +664,11 @@ app.post("/webhooks/elevenlabs", async (req, res) => {
     const api = `${D365.orgUrl}/api/data/v9.2`;
 
     // Find the lead stamped with this conversation id.
-    const q = `${api}/leads?$select=leadid&$filter=contains(description,'[conv:${convId}]')&$top=1`;
+    // Prefer the structured field; fall back to the legacy [conv:] description tag
+    // for leads created before the field migration.
+    const safeConv = String(convId).replace(/'/g, "''");
+    const q = `${api}/leads?$select=leadid&$filter=` +
+      `cr57d_conversationid eq '${safeConv}' or contains(description,'[conv:${safeConv}]')&$top=1`;
     const found = await (await fetch(q, {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
     })).json();
