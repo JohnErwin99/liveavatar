@@ -245,7 +245,7 @@ app.get("/avatar-session", async (_req, res) => {
 // Guarded by the x-iris-secret header — NOT meant to be called from the browser.
 // Shared lead creation used by both Iris (/crm/lead) and the Mailchimp webhook.
 // Returns { status: "created" | "exists", ... } or throws.
-async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details }) {
+async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details, phone }) {
   const token = await getD365Token();
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
@@ -284,11 +284,12 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
           : {}),
       subject,
       // Lead Source: Advertisement (1) for Mailchimp landing pages, Web (8) for Iris.
-      leadsourcecode: source === "mailchimp" ? 1 : 8,
+      leadsourcecode: source === "mailchimp" ? 1 : 8,  // Advertisement (1) vs Web (8)
       firstname: first_name,
       lastname: last_name || "(not provided)",
       emailaddress1: email,
       ...(company ? { companyname: company } : {}),
+      ...(phone ? { telephone1: String(phone).trim() } : {}),
       description: `${origin} — ${new Date().toISOString()}`,
       // Structured custom fields (replaces jamming everything into description).
       cr57d_leadsourcedetail: source,                               // "iris" | "mailchimp" | ...
@@ -303,6 +304,45 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
   const lead = await create.json();
   return { status: "created", leadid: lead.leadid };
 }
+
+// Browser-facing contact form on the website. Called directly from the page,
+// so it is CORS-guarded (see cors() config) rather than secret-guarded — a
+// shared secret can't live safely in page source. Reuses createOrFindLead.
+app.post("/crm/website-lead", async (req, res) => {
+  const missing = [];
+  if (!D365.tenant)   missing.push("D365_TENANT_ID");
+  if (!D365.orgUrl)   missing.push("D365_ORG_URL");
+  if (missing.length) return res.status(500).json({ status: "error", message: "CRM not configured." });
+
+  // The pricing-page form sends: first_name, last_name, email, phone, company,
+  // product (the dropdown), message. Map product -> topic.
+  const { first_name, last_name, email, company, phone, message } = req.body || {};
+  const topic = (req.body && (req.body.topic || req.body.product) || "").trim();
+  if (!first_name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ status: "invalid", message: "Please provide your name and a valid email." });
+  }
+
+  // Fold phone + free-text message into the form-answers field.
+  const details = [];
+  if (phone && String(phone).trim())   details.push(`Phone: ${String(phone).trim()}`);
+  if (message && String(message).trim()) details.push(`Message: ${String(message).trim()}`);
+
+  try {
+    const r = await createOrFindLead({
+      first_name, last_name, email, company, topic, phone,
+      source: "website-form", details,
+    });
+    // Return statuses the form's success check accepts ("created" | "exists").
+    if (r.status === "exists") {
+      return res.json({ status: "exists", message: `Thanks ${r.first_name}, we already have your details — our team will be in touch.` });
+    }
+    console.log("[iris-web] lead created:", r.leadid, email, "topic:", topic || "-");
+    res.json({ status: "created", message: "Thanks! Our team will reach out shortly with pricing." });
+  } catch (e) {
+    console.error("[iris-web] failed:", e.message);
+    res.status(500).json({ status: "error", message: "Something went wrong — please try again or email sales@iristel.com." });
+  }
+});
 
 app.post("/crm/lead", async (req, res) => {
   const missing = [];
