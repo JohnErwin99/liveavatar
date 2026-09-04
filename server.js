@@ -245,12 +245,20 @@ app.get("/avatar-session", async (_req, res) => {
 // Guarded by the x-iris-secret header — NOT meant to be called from the browser.
 // Shared lead creation used by both Iris (/crm/lead) and the Mailchimp webhook.
 // Returns { status: "created" | "exists", ... } or throws.
+function buildLeadSubject(source, topic) {
+  const prefix =
+    source === "mailchimp" ? "Golf Lead" :
+    source === "website-form" ? "Website Lead" :
+    "Iris Lead";
+  return `${prefix}${topic ? ` — ${topic}` : ""}`;
+}
+
 async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details, phone }) {
   const token = await getD365Token();
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
   const safeEmail = email.replace(/'/g, "''");
-  const q = `${api}/leads?$select=leadid,firstname,lastname,telephone1,companyname,cr57d_topicofinterest,cr57d_formanswers,cr57d_conversationid&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
+  const q = `${api}/leads?$select=leadid,subject,firstname,lastname,telephone1,companyname,cr57d_topicofinterest,cr57d_formanswers,cr57d_conversationid&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
   const dupRes = await fetch(q, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
   const dup = await dupRes.json();
   if (dupRes.ok && dup.value && dup.value.length) {
@@ -265,6 +273,10 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
     if (phone && String(phone).trim() && String(phone).trim() !== existing.telephone1) patch.telephone1 = String(phone).trim();
     if (company && company !== existing.companyname) patch.companyname = company;
     if (topic && topic !== existing.cr57d_topicofinterest) patch.cr57d_topicofinterest = topic.slice(0, 250);
+    // Refresh the Topic (subject) to the latest channel + interest so it never
+    // stays frozen on a stale prefix like "Landing page lead".
+    const freshSubject = buildLeadSubject(source, topic || existing.cr57d_topicofinterest);
+    if (freshSubject !== existing.subject) patch.subject = freshSubject;
     // Point the lead at the LATEST conversation so the post-call webhook can
     // attach this call's summary (it matches on cr57d_conversationid).
     if (conversation_id && conversation_id !== existing.cr57d_conversationid) {
@@ -305,10 +317,7 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
     return { status: "exists", first_name: knownFirst, full_name: knownName, leadid: existing.leadid, updated: Object.keys(patch) };
   }
 
-  const subject =
-    source === "mailchimp" ? `Golf Lead${topic ? ` — ${topic}` : ""}` :
-    source === "website-form" ? `Website Lead${topic ? ` — ${topic}` : ""}` :
-    `Iris Lead${topic ? ` — ${topic}` : ""}`;
+  const subject = buildLeadSubject(source, topic);
   const origin =
     source === "mailchimp" ? "Captured from Mailchimp landing page" :
     source === "website-form" ? "Captured from website pricing form" :
