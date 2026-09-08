@@ -425,17 +425,40 @@ app.post("/crm/marketplace-lead", async (req, res) => {
     return res.status(400).json({ status: "invalid", message: "An application name is required." });
   }
 
+  // cr57d_environment / cr57d_dataclassification are Choice (option set)
+  // columns -> Dataverse expects the option's integer value, not its label.
+  // Default local option-set values are assigned in creation order starting at
+  // 100000000. If your columns use different values (check the column in the
+  // maker portal), adjust these maps.
+  const ENV_OPTIONS = {
+    "sandbox": 100000000,
+    "sandbox → production": 100000001,
+    "sandbox -> production": 100000001,
+    "production": 100000002,
+  };
+  const CLASS_OPTIONS = {
+    "public": 100000000,
+    "internal": 100000001,
+    "customer confidential": 100000002,
+    "restricted": 100000003,
+  };
+  const envValue = environment != null
+    ? ENV_OPTIONS[String(environment).trim().toLowerCase()] : undefined;
+  const classValue = data_classification != null
+    ? CLASS_OPTIONS[String(data_classification).trim().toLowerCase()] : undefined;
+  if (environment && envValue === undefined)
+    console.warn("[iris-mkt] unknown environment label, skipping:", environment);
+  if (data_classification && classValue === undefined)
+    console.warn("[iris-mkt] unknown data classification label, skipping:", data_classification);
+
   // Marketplace-specific structured fields, applied on both create and repeat.
-  // NOTE: cr57d_environment / cr57d_dataclassification are written as strings.
-  // If those columns were created as Choice (option set) instead of text,
-  // map the labels to their option values here before sending.
   const mkFields = {
     ...(application_name ? { cr57d_applicationname: String(application_name).trim().slice(0, 150) } : {}),
     ...(business_owner ? { cr57d_businessowner: String(business_owner).trim().slice(0, 150) } : {}),
     ...(technical_owner ? { cr57d_technicalowner: String(technical_owner).trim().slice(0, 150) } : {}),
     ...(business_purpose ? { cr57d_businesspurpose: String(business_purpose).trim().slice(0, 2000) } : {}),
-    ...(environment ? { cr57d_environment: String(environment).trim().slice(0, 50) } : {}),
-    ...(data_classification ? { cr57d_dataclassification: String(data_classification).trim().slice(0, 50) } : {}),
+    ...(envValue !== undefined ? { cr57d_environment: envValue } : {}),
+    ...(classValue !== undefined ? { cr57d_dataclassification: classValue } : {}),
     ...(requested_scopes ? { cr57d_requestedscopes: String(requested_scopes).trim().slice(0, 500) } : {}),
   };
 
