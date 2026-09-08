@@ -13,6 +13,9 @@ app.use(express.urlencoded({ extended: true }));
 
 // Allowed origins. If ALLOWED_ORIGIN is unset -> allow all. Otherwise allow the
 // listed origins PLUS any *.webflow.io subdomain (handy for staging).
+// NOTE: the API Marketplace form lives on the partner portal — if ALLOWED_ORIGIN
+// is set, make sure it includes https://iristelpartnerportal.com and
+// https://www.iristelpartnerportal.com (webflow.io staging is auto-allowed).
 const ALLOW = (process.env.ALLOWED_ORIGIN || "")
   .split(",").map(s => s.trim().replace(/\/+$/, "")).filter(Boolean);
 
@@ -180,7 +183,7 @@ async function getD365Token() {
 }
 
 app.get("/", (_req, res) =>
-  res.json({ service: "iris-liveavatar-backend", status: "up", endpoints: ["/health", "/avatar-session", "/crm/lead"] }));
+  res.json({ service: "iris-liveavatar-backend", status: "up", endpoints: ["/health", "/avatar-session", "/crm/lead", "/crm/website-lead", "/crm/marketplace-lead"] }));
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -396,6 +399,116 @@ app.post("/crm/website-lead", async (req, res) => {
   } catch (e) {
     console.error("[iris-web] failed:", e.message);
     res.status(500).json({ status: "error", message: "Something went wrong — please try again or email sales@iristel.com." });
+  }
+});
+
+// API Marketplace access request form on the partner portal (/api-marketplace).
+// Browser-facing like /crm/website-lead: CORS-guarded, no shared secret.
+// Writes the structured cr57d_ marketplace fields instead of stuffing the
+// application details into description or form answers.
+app.post("/crm/marketplace-lead", async (req, res) => {
+  const missing = [];
+  if (!D365.tenant) missing.push("D365_TENANT_ID");
+  if (!D365.orgUrl) missing.push("D365_ORG_URL");
+  if (missing.length) return res.status(500).json({ status: "error", message: "CRM not configured." });
+
+  const {
+    first_name, last_name, email, company,
+    application_name, business_owner, technical_owner, business_purpose,
+    environment, data_classification, requested_scopes,
+  } = req.body || {};
+
+  if (!first_name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ status: "invalid", message: "Please provide your name and a valid work email." });
+  }
+  if (!application_name || !String(application_name).trim()) {
+    return res.status(400).json({ status: "invalid", message: "An application name is required." });
+  }
+
+  // Marketplace-specific structured fields, applied on both create and repeat.
+  // NOTE: cr57d_environment / cr57d_dataclassification are written as strings.
+  // If those columns were created as Choice (option set) instead of text,
+  // map the labels to their option values here before sending.
+  const mkFields = {
+    ...(application_name ? { cr57d_applicationname: String(application_name).trim().slice(0, 150) } : {}),
+    ...(business_owner ? { cr57d_businessowner: String(business_owner).trim().slice(0, 150) } : {}),
+    ...(technical_owner ? { cr57d_technicalowner: String(technical_owner).trim().slice(0, 150) } : {}),
+    ...(business_purpose ? { cr57d_businesspurpose: String(business_purpose).trim().slice(0, 2000) } : {}),
+    ...(environment ? { cr57d_environment: String(environment).trim().slice(0, 50) } : {}),
+    ...(data_classification ? { cr57d_dataclassification: String(data_classification).trim().slice(0, 50) } : {}),
+    ...(requested_scopes ? { cr57d_requestedscopes: String(requested_scopes).trim().slice(0, 500) } : {}),
+  };
+
+  try {
+    const token = await getD365Token();
+    const api = `${D365.orgUrl}/api/data/v9.2`;
+    const subject = `API Marketplace request — ${String(application_name).trim().slice(0, 150)}`;
+
+    // Dedupe on email + open lead (same rule as createOrFindLead).
+    const safeEmail = email.replace(/'/g, "''");
+    const q = `${api}/leads?$select=leadid&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
+    const dupRes = await fetch(q, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+    const dup = await dupRes.json();
+
+    if (dupRes.ok && dup.value && dup.value.length) {
+      // Repeat request: refresh the open lead with the latest application
+      // details (bumps modifiedon -> floats to the top of sales views).
+      const leadid = dup.value[0].leadid;
+      const patch = await fetch(`${api}/leads(${leadid})`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          Accept: "application/json",
+          "If-Match": "*",
+        },
+        body: JSON.stringify({
+          subject,
+          ...(company ? { companyname: company } : {}),
+          cr57d_leadsourcedetail: "api-marketplace",
+          cr57d_topicofinterest: "API Marketplace access",
+          ...mkFields,
+        }),
+      });
+      if (!patch.ok) throw new Error(`D365 patch ${patch.status}: ${await patch.text()}`);
+      console.log("[iris-mkt] repeat request, lead updated:", leadid, email, "app:", application_name);
+      return res.json({ status: "exists", message: "Request received — your existing record was updated for review." });
+    }
+
+    const create = await fetch(`${api}/leads`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        Accept: "application/json",
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify({
+        ...(D365.ownerUserId
+          ? { "ownerid@odata.bind": `/systemusers(${D365.ownerUserId})` }
+          : D365.ownerTeamId
+            ? { "ownerid@odata.bind": `/teams(${D365.ownerTeamId})` }
+            : {}),
+        subject,
+        leadsourcecode: 8, // Web
+        firstname: first_name,
+        lastname: last_name || "(not provided)",
+        emailaddress1: email,
+        ...(company ? { companyname: company } : {}),
+        description: `Captured from API Marketplace page (partner portal) — ${new Date().toISOString()}`,
+        cr57d_leadsourcedetail: "api-marketplace",
+        cr57d_topicofinterest: "API Marketplace access",
+        cr57d_capturedon: new Date().toISOString(),
+        ...mkFields,
+      }),
+    });
+    if (!create.ok) throw new Error(`D365 create ${create.status}: ${await create.text()}`);
+    const lead = await create.json();
+    console.log("[iris-mkt] lead created:", lead.leadid, email, "app:", application_name);
+    res.json({ status: "created", message: "Request submitted for review." });
+  } catch (e) {
+    console.error("[iris-mkt] failed:", e.message);
+    res.status(500).json({ status: "error", message: "CRM save failed." });
   }
 });
 
