@@ -61,10 +61,25 @@ const MC_WEBHOOK_KEY = process.env.MAILCHIMP_WEBHOOK_KEY || "";
 // ---- ServiceNow (Ciprian's API) — leave unset until credentials arrive.
 // The /support/ticket endpoint runs in "queued" mode without them, so the
 // agent flow can ship first and light up when the integration is ready.
+//
+// IMPORTANT: customers get CASES, not incidents. Incidents are internal-only
+// and not visible to the customer; a customer-opened support request must be a
+// Customer Service Management (CSM) Case so the customer can see it. The
+// endpoint therefore posts to the case table by default.
+//
+//   SERVICENOW_TABLE = sn_customerservice_case   (default — Table API on the case table)
+//
+// To use the purpose-built CSM Case API instead (runs case business rules and
+// assignment), set SERVICENOW_CASE_API=/api/sn_customerservice/case; otherwise
+// we hit /api/now/table/<SERVICENOW_TABLE>. Both accept the same case fields
+// and return result.number (a CS… number for cases).
 const SN = {
   instanceUrl: (process.env.SERVICENOW_INSTANCE_URL || "").replace(/\/+$/, ""),
   apiKey:      process.env.SERVICENOW_API_KEY || "",   // sent as x-sn-apikey header
-  table:       process.env.SERVICENOW_TABLE || "incident",
+  table:       process.env.SERVICENOW_TABLE || "sn_customerservice_case", // customer CASES, not incidents
+  // Default to Cip's CSM Case API. Set SERVICENOW_CASE_API="" to fall back to
+  // the Table API on SERVICENOW_TABLE instead.
+  caseApi:     (process.env.SERVICENOW_CASE_API ?? "/api/sn_customerservice/case").replace(/\/+$/, ""),
 };
 
 // Rebuild a valid PEM no matter how the env var was pasted (single line,
@@ -204,6 +219,8 @@ app.get("/config", (_req, res) => res.json({
   MAILCHIMP_WEBHOOK_KEY:     !!MC_WEBHOOK_KEY,
   SERVICENOW_INSTANCE_URL: !!SN.instanceUrl,
   SERVICENOW_API_KEY:      !!SN.apiKey,
+  SERVICENOW_TABLE:        SN.table,
+  SERVICENOW_CASE_API:     SN.caseApi || "(table api)",
   DOCUSIGN_BASE_URL:        !!DS.baseUrl,
   DOCUSIGN_ACCOUNT_ID:      !!DS.accountId,
   DOCUSIGN_INTEGRATION_KEY: !!DS.integrationKey,
@@ -643,8 +660,43 @@ app.post("/webhooks/mailchimp", async (req, res) => {
   }
 });
 
+// Resolve a ServiceNow customer_contact (and its account) from an email, so
+// the case can be LINKED to the real customer record instead of only naming
+// them in the description. Returns { contact, account } sys_ids, or {} if no
+// match / lookup fails. Best-effort — never blocks case creation.
+async function lookupSnContact(email) {
+  if (!email) return {};
+  try {
+    const q = `${SN.instanceUrl}/api/now/table/customer_contact` +
+      `?sysparm_query=email=${encodeURIComponent(email)}` +
+      `&sysparm_fields=sys_id,account&sysparm_limit=1`;
+    const r = await fetch(q, {
+      headers: { "x-sn-apikey": SN.apiKey, Accept: "application/json" },
+    });
+    if (!r.ok) {
+      console.warn("[iris-sn] contact lookup failed:", r.status);
+      return {};
+    }
+    const json = await r.json().catch(() => ({}));
+    const row = json.result?.[0];
+    if (!row) return {};
+    // account may be a reference object { value } or a bare sys_id string.
+    const account = row.account?.value || row.account || "";
+    return { contact: row.sys_id, account: account || undefined };
+  } catch (e) {
+    console.warn("[iris-sn] contact lookup error:", e.message);
+    return {};
+  }
+}
+
 // ElevenLabs webhook tool "create_support_ticket" calls this before a live
-// escalation, so the ticket exists WITH context before any human handoff.
+// escalation, so the CASE exists WITH context before any human handoff.
+//
+// Creates a customer-facing CSM CASE (sn_customerservice_case), NOT an
+// incident. Incidents are internal-only and never shown to the customer; a
+// support request the customer opens must be a Case so they can see it in the
+// portal. Table used is configurable via SERVICENOW_TABLE (defaults to the
+// case table); set SERVICENOW_CASE_API to hit the CSM Case API instead.
 app.post("/support/ticket", async (req, res) => {
   if (req.headers["x-iris-secret"] !== D365.toolSecret) {
     return res.status(401).json({ error: "unauthorized" });
@@ -679,8 +731,19 @@ app.post("/support/ticket", async (req, res) => {
     });
   }
 
+  // Target URL: CSM Case API if configured, else the Table API on the case table.
+  const url = SN.caseApi
+    ? `${SN.instanceUrl}${SN.caseApi}`
+    : `${SN.instanceUrl}/api/now/table/${SN.table}`;
+
+  // Try to link the case to an existing customer_contact by email. Best-effort:
+  // if no match (or the lookup fails), the case is still created — the contact's
+  // name/email remain in the description.
+  const { contact: contactSysId, account: accountSysId } = await lookupSnContact(email);
+  if (contactSysId) console.log("[iris-sn] linked contact:", contactSysId, accountSysId ? `(account ${accountSysId})` : "");
+
   try {
-    const r = await fetch(`${SN.instanceUrl}/api/now/table/${SN.table}`, {
+    const r = await fetch(url, {
       method: "POST",
       headers: {
         "x-sn-apikey": SN.apiKey,
@@ -690,25 +753,40 @@ app.post("/support/ticket", async (req, res) => {
       body: JSON.stringify({
         short_description: `Iris escalation: ${issue_summary.slice(0, 120)}`,
         description,
-        urgency: urgency === "high" ? "1" : urgency === "low" ? "3" : "2",
-        contact_type: "chat",
+        // Case priority: 1 Critical … 4 Low. Map from the caller's urgency.
+        priority: urgency === "high" ? "1" : urgency === "low" ? "4" : "3",
+        // "web" is the value real Iristel cases use (see CS0014673); "chat" may
+        // not be a valid contact_type choice on this instance.
+        contact_type: "web",
+        // Link to the real customer record when we resolved one by email.
+        ...(contactSysId ? { contact: contactSysId } : {}),
+        ...(accountSysId ? { account: accountSysId } : {}),
       }),
     });
-    const json = await r.json();
+    const json = await r.json().catch(() => ({}));
     if (!r.ok) {
-      console.error("[iris-sn] create failed:", r.status, JSON.stringify(json));
-      return res.status(502).json({ status: "error", message: "Ticket creation failed." });
+      // Surface ServiceNow's own error so auth/field problems are self-explanatory
+      // (e.g. "User is not authenticated" = the API key's REST API Access Policy
+      // doesn't cover this endpoint — a ServiceNow-side fix, not a code change).
+      const snError = json?.error?.message || json?.error?.detail || JSON.stringify(json);
+      console.error("[iris-sn] case create failed:", r.status, snError);
+      return res.status(502).json({
+        status: "error",
+        message: "Case creation failed.",
+        servicenow_status: r.status,
+        servicenow_error: snError,
+      });
     }
     const number = json.result?.number;
-    console.log("[iris-sn] ticket created:", number, "conv:", conversation_id || "-");
+    console.log("[iris-sn] case created:", number, "conv:", conversation_id || "-");
     res.json({
       status: "created",
       ticket_number: number,
-      message: `Support ticket ${number} was created. A specialist will follow up.`,
+      message: `Support case ${number} was created. A specialist will follow up.`,
     });
   } catch (e) {
     console.error("[iris-sn] failed:", e.message);
-    res.status(500).json({ status: "error", message: "Ticket creation failed." });
+    res.status(500).json({ status: "error", message: "Case creation failed." });
   }
 });
 
