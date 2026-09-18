@@ -249,14 +249,13 @@ app.get("/avatar-session", async (_req, res) => {
       headers: { "X-API-KEY": LA_KEY, "content-type": "application/json" },
       body: JSON.stringify({
         avatar_id: AVATAR_ID,
-        // Per current LiveAvatar docs, a stored Voice Agent session must be
-        // requested as mode FULL (LITE now means "Avatar Only — bring your own
-        // ASR/LLM/TTS", which ignores the agent and breaks session.message()
-        // with "Not permitted in LITE mode"). Do NOT add per-session
-        // language/dynamic_variables with a stored voice agent (400).
+        // Stored voice agent: send NO mode field — the API derives it from the
+        // agent type (400: "mode=FULL does not apply to a voice_agent of type
+        // 'elevenlabs_agent'; omit mode and let it derive from the agent").
+        // Do NOT add per-session language/dynamic_variables either (400).
         // Legacy inline config stays on LITE as fallback.
         ...(VOICE_AGENT_ID
-          ? { mode: "FULL", voice_agent: { id: VOICE_AGENT_ID } }
+          ? { voice_agent: { id: VOICE_AGENT_ID } }
           : { mode: "LITE", elevenlabs_agent_config: { secret_id: SECRET_ID, agent_id: AGENT_ID } }),
       }),
     });
