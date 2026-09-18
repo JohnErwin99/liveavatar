@@ -248,14 +248,16 @@ app.get("/avatar-session", async (_req, res) => {
       method: "POST",
       headers: { "X-API-KEY": LA_KEY, "content-type": "application/json" },
       body: JSON.stringify({
-        mode: "LITE",
         avatar_id: AVATAR_ID,
-        // Stored Voice Agent when configured (do NOT add per-session
-        // language/dynamic_variables with it — rejected with 400);
-        // otherwise legacy inline agent config.
+        // Per current LiveAvatar docs, a stored Voice Agent session must be
+        // requested as mode FULL (LITE now means "Avatar Only — bring your own
+        // ASR/LLM/TTS", which ignores the agent and breaks session.message()
+        // with "Not permitted in LITE mode"). Do NOT add per-session
+        // language/dynamic_variables with a stored voice agent (400).
+        // Legacy inline config stays on LITE as fallback.
         ...(VOICE_AGENT_ID
-          ? { voice_agent: { id: VOICE_AGENT_ID } }
-          : { elevenlabs_agent_config: { secret_id: SECRET_ID, agent_id: AGENT_ID } }),
+          ? { mode: "FULL", voice_agent: { id: VOICE_AGENT_ID } }
+          : { mode: "LITE", elevenlabs_agent_config: { secret_id: SECRET_ID, agent_id: AGENT_ID } }),
       }),
     });
     const json = await r.json();
