@@ -34,6 +34,10 @@ const LA_KEY    = process.env.LIVEAVATAR_API_KEY;     // your (rotated) LiveAvat
 const SECRET_ID = process.env.LIVEAVATAR_SECRET_ID;   // from the one-time secret registration
 const AVATAR_ID = process.env.LIVEAVATAR_AVATAR_ID;   // the avatar you picked in LiveAvatar
 const AGENT_ID  = process.env.ELEVENLABS_AGENT_ID || "agent_4301kq7pcrscezmrvnegnz2sqp95";
+// Stored LiveAvatar Voice Agent (recommended path — created at
+// app.liveavatar.com/voice-agent). When set, sessions reference it by id
+// instead of passing secret_id/agent_id inline. Inline stays as fallback.
+const VOICE_AGENT_ID = process.env.LIVEAVATAR_VOICE_AGENT_ID || "";
 
 // ---- D365 CRM (sandbox) lead capture ----
 const D365 = {
@@ -208,6 +212,7 @@ app.get("/config", (_req, res) => res.json({
   LIVEAVATAR_SECRET_ID: !!SECRET_ID,
   LIVEAVATAR_AVATAR_ID: !!AVATAR_ID,
   ELEVENLABS_AGENT_ID:  AGENT_ID,
+  LIVEAVATAR_VOICE_AGENT_ID: VOICE_AGENT_ID || "(inline agent config)",
   D365_TENANT_ID:       !!D365.tenant,
   D365_CLIENT_ID:       !!D365.clientId,
   D365_CLIENT_SECRET:   !!D365.clientSecret,
@@ -245,7 +250,12 @@ app.get("/avatar-session", async (_req, res) => {
       body: JSON.stringify({
         mode: "LITE",
         avatar_id: AVATAR_ID,
-        elevenlabs_agent_config: { secret_id: SECRET_ID, agent_id: AGENT_ID },
+        // Stored Voice Agent when configured (do NOT add per-session
+        // language/dynamic_variables with it — rejected with 400);
+        // otherwise legacy inline agent config.
+        ...(VOICE_AGENT_ID
+          ? { voice_agent: { id: VOICE_AGENT_ID } }
+          : { elevenlabs_agent_config: { secret_id: SECRET_ID, agent_id: AGENT_ID } }),
       }),
     });
     const json = await r.json();
