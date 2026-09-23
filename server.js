@@ -579,7 +579,7 @@ app.post("/crm/lead", async (req, res) => {
     return res.status(401).json({ error: "unauthorized" });
   }
 
-  const { first_name, last_name, email, company, topic, conversation_id } = req.body || {};
+  const { first_name, last_name, email, company, topic, conversation_id, phone } = req.body || {};
   if (!first_name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({
       status: "invalid",
@@ -587,8 +587,15 @@ app.post("/crm/lead", async (req, res) => {
     });
   }
 
+  // Discovery-survey answers arrive as one newline-separated string from the
+  // ElevenLabs tool; split into the lines createOrFindLead appends to
+  // cr57d_formanswers (arrays accepted too, for parity with the other routes).
+  const details = typeof req.body?.details === "string"
+    ? req.body.details.split("\n").map(s => s.trim()).filter(Boolean)
+    : Array.isArray(req.body?.details) ? req.body.details : [];
+
   try {
-    const r = await createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source: "iris" });
+    const r = await createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, phone, source: "iris", details });
     if (r.status === "exists") {
       console.log("[iris-crm] returning customer:", email, "->", r.full_name);
       return res.json({
