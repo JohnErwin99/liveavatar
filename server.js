@@ -222,6 +222,7 @@ app.get("/config", (_req, res) => res.json({
   D365_OWNER_TEAM_ID:   !!D365.ownerTeamId,
   ELEVENLABS_WEBHOOK_SECRET: !!EL_WEBHOOK_SECRET,
   MAILCHIMP_WEBHOOK_KEY:     !!MC_WEBHOOK_KEY,
+  MIND_API_KEY:            !!process.env.MIND_API_KEY,
   SERVICENOW_INSTANCE_URL: !!SN.instanceUrl,
   SERVICENOW_API_KEY:      !!SN.apiKey,
   SERVICENOW_TABLE:        SN.table,
@@ -389,6 +390,124 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
   if (!create.ok) throw new Error(`D365 create ${create.status}: ${await create.text()}`);
   const lead = await create.json();
   return { status: "created", leadid: lead.leadid };
+}
+
+// MIND (Iristel-X) account lookup by email. A hit means the person is an
+// EXISTING CUSTOMER — they must never become a Lead; their interactions are
+// recorded on a Contact under their Account instead (see upsertCustomerContact).
+// Fails open: any error returns null so capture still lands as a lead.
+const MIND_API_KEY = process.env.MIND_API_KEY || "";
+
+async function lookupMindAccount(email) {
+  if (!MIND_API_KEY || !email) return null;
+  try {
+    const r = await fetch(`https://api.iristelx.com/?email=${encodeURIComponent(email)}`, {
+      headers: { "x-api-key": MIND_API_KEY, Accept: "application/json" },
+    });
+    if (!r.ok) return null;
+    const json = await r.json().catch(() => null);
+    // The gateway answers HTTP 200 with {statusCode:404, body:"...not found..."}
+    // on a miss — that shape means "no account", not an error.
+    if (!json || json.statusCode === 404 || !json.name) return null;
+    return json;
+  } catch (e) {
+    console.warn("[iris-mind] lookup failed:", e.message);
+    return null;
+  }
+}
+
+// Customer path for /crm/lead: upsert a Dynamics Contact (matched by email),
+// hang it off the Account named after the MIND account, and record the
+// interaction (topic + discovery details) as an annotation on the contact —
+// the customer-side equivalent of cr57d_formanswers on a lead.
+async function upsertCustomerContact({ first_name, last_name, email, company, topic, phone, details, conversation_id, mind }) {
+  const token = await getD365Token();
+  const api = `${D365.orgUrl}/api/data/v9.2`;
+  const H = {
+    Authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+    Accept: "application/json",
+  };
+  const safeEmail = email.replace(/'/g, "''");
+  const accountName = String(mind.name || company || "").trim();
+
+  // 1. Account by name (create if missing) — the MIND account name is the anchor.
+  let accountId = null;
+  if (accountName) {
+    const safeName = accountName.replace(/'/g, "''");
+    const aRes = await fetch(`${api}/accounts?$select=accountid&$filter=name eq '${safeName}'&$top=1`, { headers: H });
+    const aJson = await aRes.json().catch(() => ({}));
+    if (aRes.ok && aJson.value?.length) {
+      accountId = aJson.value[0].accountid;
+    } else {
+      const aCreate = await fetch(`${api}/accounts`, {
+        method: "POST",
+        headers: { ...H, Prefer: "return=representation" },
+        body: JSON.stringify({ name: accountName }),
+      });
+      if (aCreate.ok) accountId = (await aCreate.json()).accountid;
+      else console.error("[iris-crm] account create failed:", aCreate.status, await aCreate.text());
+    }
+  }
+
+  // 2. Contact by email: PATCH (fill/correct, never blank) or POST.
+  const cRes = await fetch(
+    `${api}/contacts?$select=contactid,firstname,lastname,telephone1,_parentcustomerid_value&$filter=emailaddress1 eq '${safeEmail}'&$top=1`,
+    { headers: H });
+  const cJson = await cRes.json().catch(() => ({}));
+  let contactId = cRes.ok && cJson.value?.length ? cJson.value[0].contactid : null;
+
+  if (contactId) {
+    const existing = cJson.value[0];
+    const patch = {};
+    if (first_name && first_name !== existing.firstname) patch.firstname = first_name;
+    if (last_name && last_name !== existing.lastname) patch.lastname = last_name;
+    if (phone && String(phone).trim() && String(phone).trim() !== existing.telephone1) patch.telephone1 = String(phone).trim();
+    if (accountId && existing._parentcustomerid_value !== accountId) {
+      patch["parentcustomerid_account@odata.bind"] = `/accounts(${accountId})`;
+    }
+    if (Object.keys(patch).length) {
+      const up = await fetch(`${api}/contacts(${contactId})`, {
+        method: "PATCH", headers: { ...H, "If-Match": "*" }, body: JSON.stringify(patch),
+      });
+      if (!up.ok) console.error("[iris-crm] contact update failed:", up.status, await up.text());
+    }
+  } else {
+    const cCreate = await fetch(`${api}/contacts`, {
+      method: "POST",
+      headers: { ...H, Prefer: "return=representation" },
+      body: JSON.stringify({
+        firstname: first_name,
+        lastname: last_name || "(not provided)",
+        emailaddress1: email,
+        ...(phone ? { telephone1: String(phone).trim() } : {}),
+        ...(accountId ? { "parentcustomerid_account@odata.bind": `/accounts(${accountId})` } : {}),
+      }),
+    });
+    if (!cCreate.ok) throw new Error(`D365 contact create ${cCreate.status}: ${await cCreate.text()}`);
+    contactId = (await cCreate.json()).contactid;
+  }
+
+  // 3. Record the interaction as a note on the contact.
+  const noteLines = [
+    ...(topic ? [`Topic: ${topic}`] : []),
+    ...(details || []),
+    ...(conversation_id ? [`Conversation: ${conversation_id}`] : []),
+  ];
+  if (noteLines.length) {
+    const note = await fetch(`${api}/annotations`, {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({
+        subject: `Iris conversation — ${new Date().toISOString().slice(0, 16)}`,
+        notetext: noteLines.join("\n").slice(0, 4000),
+        "objectid_contact@odata.bind": `/contacts(${contactId})`,
+      }),
+    });
+    if (!note.ok) console.error("[iris-crm] annotation failed:", note.status, await note.text());
+  }
+
+  return { status: "customer", contactid: contactId, account_name: accountName };
 }
 
 // Browser-facing contact form on the website. Called directly from the page,
@@ -595,6 +714,20 @@ app.post("/crm/lead", async (req, res) => {
     : Array.isArray(req.body?.details) ? req.body.details : [];
 
   try {
+    // Existing MIND account = existing CUSTOMER: never create a lead for them.
+    // Record the interaction on a Contact under their Account instead.
+    const mind = await lookupMindAccount(email);
+    if (mind) {
+      const c = await upsertCustomerContact({ first_name, last_name, email, company, topic, phone, details, conversation_id, mind });
+      console.log("[iris-crm] customer contact:", c.contactid, email, "account:", c.account_name || "-");
+      return res.json({
+        status: "customer",
+        first_name,
+        account_name: c.account_name,
+        message: `Existing customer${c.account_name ? ` — account ${c.account_name}` : ""}. Greet warmly and use existing-customer pricing. Do not mention any lookup or system.`,
+      });
+    }
+
     const r = await createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, phone, source: "iris", details });
     if (r.status === "exists") {
       console.log("[iris-crm] returning customer:", email, "->", r.full_name);
