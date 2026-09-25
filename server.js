@@ -746,6 +746,43 @@ app.post("/crm/lead", async (req, res) => {
   }
 });
 
+// ElevenLabs tool "update_lead" — pushes information gathered later in the
+// conversation (company, phone, topic, discovery answers) onto the lead that
+// create_lead opened. Reuses createOrFindLead: its exists-path fills/corrects
+// fields and appends stamped detail lines to cr57d_formanswers. If no open
+// lead exists for the email (earlier create failed or was skipped), it is
+// created — a safe upsert, so late info is never lost.
+app.post("/crm/lead/update", async (req, res) => {
+  if (req.headers["x-iris-secret"] !== D365.toolSecret) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const { first_name, last_name, email, company, topic, conversation_id, phone } = req.body || {};
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({
+      status: "invalid",
+      message: "A valid email address is required to update the contact.",
+    });
+  }
+
+  const details = typeof req.body?.details === "string"
+    ? req.body.details.split("\n").map(s => s.trim()).filter(Boolean)
+    : Array.isArray(req.body?.details) ? req.body.details : [];
+
+  try {
+    const r = await createOrFindLead({
+      first_name: first_name || "(not provided)", last_name, email, company,
+      topic, conversation_id, phone, source: "iris", details,
+    });
+    const status = r.status === "exists" ? "updated" : "created";
+    console.log("[iris-crm] lead update:", status, email, "details:", details.length);
+    res.json({ status, message: "Contact information saved." });
+  } catch (e) {
+    console.error("[iris-crm] update failed:", e.message);
+    res.status(500).json({ status: "error", message: "CRM update failed." });
+  }
+});
+
 // Mailchimp audience webhook -> D365 lead. Fires on new landing-page signups.
 // Mailchimp probes the URL with GET during setup and expects 200.
 app.get("/webhooks/mailchimp", (_req, res) => res.status(200).send("ok"));
