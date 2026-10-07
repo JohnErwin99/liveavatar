@@ -202,7 +202,7 @@ async function getD365Token() {
 }
 
 app.get("/", (_req, res) =>
-  res.json({ service: "iris-liveavatar-backend", status: "up", endpoints: ["/health", "/avatar-session", "/crm/lead", "/crm/website-lead", "/crm/marketplace-lead"] }));
+  res.json({ service: "iris-liveavatar-backend", status: "up", endpoints: ["/health", "/avatar-session", "/crm/lead", "/crm/quote", "/crm/website-lead", "/crm/marketplace-lead"] }));
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -220,6 +220,11 @@ app.get("/config", (_req, res) => res.json({
   IRIS_TOOL_SECRET:     !!D365.toolSecret,
   D365_OWNER_USER_ID:   !!D365.ownerUserId,
   D365_OWNER_TEAM_ID:   !!D365.ownerTeamId,
+  QUOTE_PRICE_LIST_ID:          !!QUOTE.priceListId,
+  QUOTE_PRICE_LIST_EXISTING_ID: !!QUOTE.priceListExistingId,
+  QUOTE_OWNER_USER_ID:          !!QUOTE.ownerUserId,
+  QUOTE_DEFAULT_TEMPLATE:       QUOTE.defaultTemplate,
+  QUOTE_PRODUCT_OVERRIDES:      Object.keys(QUOTE_PRODUCT_OVERRIDES).length,
   ELEVENLABS_WEBHOOK_SECRET: !!EL_WEBHOOK_SECRET,
   MAILCHIMP_WEBHOOK_KEY:     !!MC_WEBHOOK_KEY,
   MIND_API_KEY:            !!process.env.MIND_API_KEY,
@@ -510,6 +515,377 @@ async function upsertCustomerContact({ first_name, last_name, email, company, to
   return { status: "customer", contactid: contactId, account_name: accountName };
 }
 
+// ---- Quotes in Dynamics 365 (Iris-Sales) — replaces NiftyQuoter ----
+// Iris calls create_quote once; the server finds/creates the account + contact,
+// builds the quote on the price list, renders the PDF from the developer's
+// quote Word template, attaches it, and leaves a review task for sales.
+// Quotes are drafts: a rep reviews and sends them from Iris-Sales.
+const QUOTE = {
+  priceListId:         process.env.QUOTE_PRICE_LIST_ID || "",
+  priceListExistingId: process.env.QUOTE_PRICE_LIST_EXISTING_ID || "",
+  currencyId:          process.env.QUOTE_CURRENCY_ID || "cb89c237-08c9-f011-8543-000d3af4e871", // CAD
+  ownerUserId:         process.env.QUOTE_OWNER_USER_ID || "",
+  defaultTemplate:     process.env.QUOTE_DEFAULT_TEMPLATE || "Print quote for customer",
+};
+// Testing only: {"sc_pro_new":"TEST-PRD-01", ...} points catalog ids at other
+// D365 product numbers until the real products are published.
+const QUOTE_PRODUCT_OVERRIDES = (() => {
+  try { return JSON.parse(process.env.QUOTE_PRODUCT_OVERRIDES || "{}"); }
+  catch { console.warn("[iris-quote] QUOTE_PRODUCT_OVERRIDES is not valid JSON — ignored"); return {}; }
+})();
+
+// Iris catalog id -> D365 product number, friendly name, catalog price (used
+// only for a write-in line when the product isn't active on the price list),
+// line description, and which quote template family it belongs to.
+const QUOTE_PRODUCTS = {
+  sc_essentials_new: { pn: "BNDL1", name: "Essentials Smart Connect Bundle", price: 25, family: "webex",
+    desc: "Cloud Calling, Webex Basic, Standard Call Recording, Virtual Fax, Eset Cybersecurity Training, Smarter Messaging Entry" },
+  sc_pro_new: { pn: "BNDL2", name: "Pro Smart Connect Bundle", price: 45, family: "webex",
+    desc: "Cloud Calling, Standard Webex, Unified Capture Call Recording, Virtual Fax, Eset Cybersecurity Protect Advanced, Smarter Messaging Growth" },
+  sc_premium_new: { pn: "BNDL3", name: "Premium Smart Connect Bundle", price: 75, family: "webex",
+    desc: "Cloud Calling, Standard Webex, Insights & AI Call Recording, Virtual Fax, Eset Cybersecurity Protect Advanced + training, Smarter Messaging Ultimate" },
+  sc_essentials: { pn: "BNDL1", name: "Essentials Smart Connect Bundle (existing customer)", price: 23, family: "webex",
+    desc: "Cloud Calling, Standard Webex or Teams, Standard Call Recording, Virtual Fax, Cybersecurity Training, IP Vulnerability Scan, SMS" },
+  sc_pro: { pn: "BNDL2", name: "Pro Smart Connect Bundle (existing customer)", price: 33, family: "webex",
+    desc: "Cloud Calling, Standard Webex or Teams, Unified Capture Call Recording, Virtual Fax 50pg, Cybersecurity Training, SMS 100 outgoing, IP Scan" },
+  sc_premium: { pn: "BNDL3", name: "Premium Smart Connect Bundle (existing customer)", price: 63, family: "webex",
+    desc: "Cloud Calling, Standard Webex or Teams, Insights & AI Call Recording, Virtual Fax 200pg, Cybersecurity Training, SMS 300 outgoing, IP Scan" },
+  pbx_unite: { pn: "CC1", name: "Iristel Unite", price: 20, family: "webex", desc: "Cloud Voice, Unlimited Canada & US Calling, DID, Auto Attendant, BLF" },
+  pbx_webex_basic: { pn: "CC2", name: "Iristel Unite with Webex Basic", price: 24, family: "webex", desc: "Cloud Voice + Webex Softphone, Messaging, File Sharing" },
+  pbx_webex_standard: { pn: "CC3", name: "Iristel Unite with Webex Standard", price: 29, family: "webex", desc: "Cloud Voice + Webex, Meeting Room (25 capacity)" },
+  pbx_webex_premium: { pn: "CC4", name: "Iristel Unite with Webex Premium", price: 46, family: "webex", desc: "Cloud Voice + Webex, Meeting Room (1000 capacity)" },
+  pbx_common_area: { pn: "CC5", name: "Common Area Extension", price: 10, family: "webex" },
+  pbx_auto_attendant: { pn: "CC6", name: "Auto-Attendant", price: 30, family: "webex" },
+  pbx_aa_activation: { pn: null, name: "Auto-Attendant Activation (one-time)", price: 50, family: "webex" },
+  pbx_call_queue_basic: { pn: "CC8", name: "Call Queue Basic (per agent)", price: 10, family: "webex" },
+  pbx_call_queue_premium: { pn: "CC9", name: "Call Queue Premium (per agent)", price: 20, family: "webex" },
+  pbx_virtual_fwd: { pn: "CC10", name: "Virtual Number with Call Forwarding", price: 10, family: "webex" },
+  pbx_virtual_vm: { pn: "CC11", name: "Virtual Number with Voicemail", price: 15, family: "webex" },
+  pbx_hunt_group: { pn: "CC12", name: "Hunt Group", price: 5, family: "webex" },
+  pbx_sms_webex: { pn: null, name: "SMS on Webex", price: 7, family: "webex" },
+  pbx_key_system: { pn: "CC13", name: "Key System User", price: 10, family: "webex" },
+  pbx_cloud_connect: { pn: "CCI1", name: "Cloud Connect for Webex Calling", price: 10, family: "webex" },
+  pbx_user_activation: { pn: "CC7", name: "User Activation (one-time, per user)", price: 25, family: "webex" },
+  cc_core_voice: { pn: "CON1", name: "Cloud Contact Center — Core Voice", price: 80, family: "contact", desc: "Manage all Inbound, Outbound, and Blended campaigns" },
+  cc_omni_channel: { pn: "CON2", name: "Cloud Contact Center — Omni Channel", price: 110, family: "contact", desc: "Manage all interactions across every channel with the Unified Inbox" },
+  cc_setup_fee: { pn: "CON3", name: "Cloud Contact Center Set Up (one-time)", price: 4000, family: "contact" },
+  cc_recording_ai: { pn: "CON4", name: "Cloud Contact Call Recording AI", price: 7, family: "contact" },
+  cc_custom_dev: { pn: "CON5", name: "Custom Development (per hour)", price: 200, family: "contact" },
+};
+// Quote Word templates by family (name prefix; the highest active "vN" wins,
+// so a new version is picked up without a code change). Families without a
+// template — and the SIP / Teams templates, kept for products added later —
+// fall back to QUOTE.defaultTemplate.
+const QUOTE_TEMPLATE_PREFIX = {
+  webex: "Iristel Unite with Webex",
+  sip: "Iristel SIP Channel Service",
+  teams: "Iristel Operator Connect for Teams",
+};
+
+async function d365(method, path, body, headers) {
+  const token = await getD365Token();
+  const r = await fetch(`${D365.orgUrl}/api/data/v9.2${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "content-type": "application/json",
+      "OData-MaxVersion": "4.0", "OData-Version": "4.0",
+      ...(headers || {}),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await r.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
+  return { ok: r.ok, status: r.status, json, text };
+}
+const odq = (s) => String(s).replace(/'/g, "''");
+const must = (r, what) => { if (!r.ok) throw new Error(`${what}: ${r.status} ${r.text.slice(0, 300)}`); return r; };
+
+// MIND account -> CRM fields. The email lookup's field names are mapped
+// defensively (the gateway has returned both flat and nested shapes).
+function mindDetails(mind) {
+  const c = mind.contact || {};
+  const pick = (...v) => v.map((x) => (x == null ? "" : String(x).trim())).find(Boolean) || "";
+  const phone = typeof c.phone === "object" && c.phone
+    ? pick(c.phone.mobile, c.phone.work, c.phone.home) : pick(c.phone, mind.phone, mind.telephoneNumber);
+  return {
+    number: pick(mind.accountId, mind.account_code, mind.accountCode, mind.code),
+    name: pick(mind.name),
+    firstname: pick(c.fname, c.firstName, mind.fname),
+    lastname: pick(c.lname, c.lastName, mind.lname),
+    phone,
+    address1: pick(c.address1, mind.address1, mind.address && mind.address.line1),
+    city: pick(c.city, mind.city, mind.address && mind.address.city),
+    province: pick(c.province, mind.province, mind.address && mind.address.province),
+    postalCode: pick(c.postalCode, mind.postalCode, mind.address && mind.address.postalCode),
+    country: pick(c.country, mind.country, mind.address && mind.address.country),
+  };
+}
+const dropEmpty = (o) => { for (const k of Object.keys(o)) if (o[k] === undefined || o[k] === null || o[k] === "") delete o[k]; return o; };
+
+// Upsert the contact by email, link it to the account, make it primary.
+async function linkQuoteContact(accountId, existing, email, f) {
+  const fields = dropEmpty({
+    firstname: f.firstname, lastname: f.lastname, telephone1: f.phone,
+    "parentcustomerid_account@odata.bind": `/accounts(${accountId})`,
+  });
+  let contactId;
+  if (existing) {
+    contactId = existing.contactid;
+    must(await d365("PATCH", `/contacts(${contactId})`, fields, { "If-Match": "*" }), "contact update");
+  } else {
+    const r = await d365("POST", "/contacts", {
+      ...fields, emailaddress1: email, lastname: f.lastname || "(not provided)",
+      description: "Created by Iris for a quote request",
+    }, { Prefer: "return=representation" });
+    contactId = must(r, "contact create").json.contactid;
+  }
+  must(await d365("PATCH", `/accounts(${accountId})`, { "primarycontactid@odata.bind": `/contacts(${contactId})` }, { "If-Match": "*" }),
+    "primary contact");
+  return contactId;
+}
+
+// Who is the quote for? Three paths, decided from the confirmed email:
+//   crm  — already in Dynamics (contact's account, or account by email / MIND number)
+//   mind — an Iristel (MIND) customer with no CRM account: create it from MIND
+//   lead — a new prospect: create/reuse the lead and qualify it to an
+//          opportunity (Dynamics can't put a quote on a lead directly)
+async function resolveQuoteCustomer({ first_name, last_name, email, company, phone, topic, conversation_id }) {
+  const typed = { firstname: first_name, lastname: last_name, phone: phone ? String(phone).trim() : "" };
+
+  // 1. CRM by email.
+  const c = must(await d365("GET", `/contacts?$select=contactid,_parentcustomerid_value&$filter=emailaddress1 eq '${odq(email)}'&$top=1`), "contact lookup");
+  const contact = c.json.value[0];
+  let accountId = contact && contact._parentcustomerid_value;
+  if (accountId && !(await d365("GET", `/accounts(${accountId})?$select=accountid`)).ok) accountId = null; // parent may be a contact
+  if (!accountId) {
+    const a = must(await d365("GET", `/accounts?$select=accountid&$filter=emailaddress1 eq '${odq(email)}'&$top=1`), "account lookup");
+    accountId = a.json.value[0] && a.json.value[0].accountid;
+  }
+
+  // 2. MIND (email check); its account number can also find the CRM account.
+  const mind = await lookupMindAccount(email);
+  const m = mind ? mindDetails(mind) : null;
+  if (!accountId && m && m.number) {
+    const a = await d365("GET", `/accounts?$select=accountid&$filter=cr57d_mindaccountnumber eq '${odq(m.number)}'&$top=1`);
+    accountId = a.ok && a.json.value[0] && a.json.value[0].accountid;
+  }
+
+  if (accountId) {
+    const acc = must(await d365("GET", `/accounts(${accountId})?$select=name`), "account read").json;
+    const contactId = await linkQuoteContact(accountId, contact, email, typed);
+    // A prospect whose lead was already qualified: keep quoting on that
+    // still-open opportunity so sales sees every quote in one place.
+    const open = await openLeadOpportunity(email);
+    if (open && open.o._parentaccountid_value === accountId) {
+      return { ...(await quoteFromOpportunity(open.leadId, open.opportunityId, open.o, null, email)), path: "lead" };
+    }
+    return { path: "crm", accountId, contactId, accountName: acc.name, isCustomer: !!m };
+  }
+
+  if (m) {
+    const name = m.name || company || [first_name, last_name].filter(Boolean).join(" ") || email;
+    const a = await d365("POST", "/accounts", dropEmpty({
+      name, emailaddress1: email,
+      telephone1: m.phone || typed.phone,
+      address1_line1: m.address1, address1_city: m.city, address1_stateorprovince: m.province,
+      address1_postalcode: m.postalCode, address1_country: m.country,
+      cr57d_mindaccountnumber: m.number,
+      description: `Created by Iris from MIND account${m.number ? " " + m.number : ""}`,
+    }), { Prefer: "return=representation" });
+    accountId = must(a, "account create").json.accountid;
+    const contactId = await linkQuoteContact(accountId, contact, email, {
+      firstname: m.firstname || typed.firstname, lastname: m.lastname || typed.lastname, phone: m.phone || typed.phone,
+    });
+    return { path: "mind", accountId, contactId, accountName: name, isCustomer: true };
+  }
+
+  // 3. New prospect. A lead already qualified for this email reuses its opportunity.
+  const open = await openLeadOpportunity(email);
+  if (open) return quoteFromOpportunity(open.leadId, open.opportunityId, open.o, company, email);
+  const lead = await createOrFindLead({
+    first_name: first_name || "(not provided)", last_name, email, company, phone, topic,
+    conversation_id, source: "iris", details: [],
+  });
+  // Qualification makes the account from the lead's company name.
+  if (company) {
+    must(await d365("PATCH", `/leads(${lead.leadid})`, { companyname: company }, { "If-Match": "*" }), "lead company");
+  }
+  const qr = await d365("POST", `/leads(${lead.leadid})/Microsoft.Dynamics.CRM.QualifyLead`, {
+    CreateAccount: !!company, CreateContact: true, CreateOpportunity: true, Status: 3,
+    OpportunityCurrencyId: { "@odata.type": "Microsoft.Dynamics.CRM.transactioncurrency", transactioncurrencyid: QUOTE.currencyId },
+    SuppressDuplicateDetection: true,
+  });
+  must(qr, "lead qualify");
+  const made = (qr.json && qr.json.value) || [];
+  const opp = made.find((x) => x.opportunityid);
+  if (!opp) throw new Error("lead qualify: no opportunity returned");
+  const o = must(await d365("GET", `/opportunities(${opp.opportunityid})?$select=statecode,_parentaccountid_value,_parentcontactid_value,_customerid_value`), "opportunity read").json;
+  return quoteFromOpportunity(lead.leadid, opp.opportunityid, o, company, email);
+}
+
+// The still-open opportunity of this email's most recent qualified lead, if any.
+async function openLeadOpportunity(email) {
+  const q = await d365("GET", `/leads?$select=leadid,_qualifyingopportunityid_value&$filter=emailaddress1 eq '${odq(email)}' and statecode eq 1 and _qualifyingopportunityid_value ne null&$orderby=modifiedon desc&$top=1`);
+  const lead = q.ok && q.json.value[0];
+  if (!lead) return null;
+  const r = await d365("GET", `/opportunities(${lead._qualifyingopportunityid_value})?$select=statecode,_parentaccountid_value,_parentcontactid_value,_customerid_value`);
+  if (!r.ok || r.json.statecode !== 0) return null;
+  return { leadId: lead.leadid, opportunityId: lead._qualifyingopportunityid_value, o: r.json };
+}
+
+async function quoteFromOpportunity(leadId, opportunityId, o, company, email) {
+  const accountId = o._parentaccountid_value || null;
+  const contactId = o._parentcontactid_value || null;
+  let accountName = company || email;
+  if (accountId) {
+    const a = await d365("GET", `/accounts(${accountId})?$select=name`);
+    if (a.ok) accountName = a.json.name;
+  }
+  return { path: "lead", leadId, opportunityId, accountId, contactId, accountName, isCustomer: false };
+}
+
+// Is this product active and on the price list? Returns { productId, uomId } or null.
+async function quotePriceListProduct(productNumber, priceListId) {
+  if (!productNumber) return null;
+  const p = await d365("GET", `/products?$select=productid,statecode,_defaultuomid_value&$filter=productnumber eq '${odq(productNumber)}' and statecode eq 0&$top=1`);
+  const prod = p.ok && p.json.value[0];
+  if (!prod) return null;
+  const ppl = await d365("GET", `/productpricelevels?$select=_uomid_value&$filter=_productid_value eq ${prod.productid} and _pricelevelid_value eq ${priceListId}&$top=1`);
+  const item = ppl.ok && ppl.json.value[0];
+  if (!item) return null;
+  return { productId: prod.productid, uomId: item._uomid_value || prod._defaultuomid_value };
+}
+
+// Highest active version of a quote template whose name starts with prefix.
+async function quoteTemplateId(prefix) {
+  const r = await d365("GET", `/documenttemplates?$select=documenttemplateid,name&$filter=associatedentitytypecode eq 'quote' and status eq false and startswith(name,'${odq(prefix)}')`);
+  if (!r.ok || !r.json.value.length) return null;
+  const ver = (n) => +((String(n).match(/v(\d+)\s*$/i) || [])[1] || 0);
+  return r.json.value.sort((a, b) => ver(b.name) - ver(a.name))[0];
+}
+
+// Render the quote PDF from a Word template and attach it to the quote as a note.
+async function attachQuotePdf(quoteId, template, fileName) {
+  const r = await d365("POST", "/ExportPdfDocument", {
+    EntityTypeCode: 1084,
+    SelectedTemplate: { "@odata.type": "Microsoft.Dynamics.CRM.documenttemplate", documenttemplateid: template.documenttemplateid },
+    SelectedRecords: JSON.stringify([quoteId]),
+  });
+  must(r, "PDF export");
+  const pdf = r.json && r.json.PdfFile;
+  if (!pdf) throw new Error("PDF export returned no file");
+  must(await d365("POST", "/annotations", {
+    subject: `Quote PDF — ${template.name}`,
+    notetext: "Generated by Iris from the quote template. Review, then send to the customer.",
+    filename: fileName, mimetype: "application/pdf", documentbody: pdf,
+    "objectid_quote@odata.bind": `/quotes(${quoteId})`,
+  }), "PDF attach");
+}
+
+async function createQuote({ first_name, last_name, email, company, phone, customer_type, items, notes, conversation_id }) {
+  const products = items.map((i) => ({ ...QUOTE_PRODUCTS[i.product], id: i.product, quantity: i.quantity }));
+  const who = await resolveQuoteCustomer({
+    first_name, last_name, email, company, phone, conversation_id,
+    topic: `Quote request — ${[...new Set(products.map((p) => p.name))].join(", ")}`.slice(0, 250),
+  });
+  const { accountId, contactId, accountName } = who;
+  // Existing-customer pricing when Iris says so or MIND confirms it.
+  const existing = customer_type === "existing" || who.isCustomer;
+  const priceListId = (existing && QUOTE.priceListExistingId) || QUOTE.priceListId;
+  const pathNote = {
+    crm: "Existing CRM customer.",
+    mind: "Iristel (MIND) customer — CRM account created from MIND.",
+    lead: "New prospect — lead qualified to an opportunity.",
+  }[who.path];
+  if (who.opportunityId) {
+    // The opportunity carries the same price list as the quote.
+    const up = await d365("PATCH", `/opportunities(${who.opportunityId})`,
+      { "pricelevelid@odata.bind": `/pricelevels(${priceListId})` }, { "If-Match": "*" });
+    if (!up.ok) console.warn("[iris-quote] opportunity price list:", up.status, up.text.slice(0, 200));
+  }
+  const title = `${accountName} Quote — ${[...new Set(products.map((p) => p.name))].join(", ")}`.slice(0, 300);
+  const owner = QUOTE.ownerUserId ? { "ownerid@odata.bind": `/systemusers(${QUOTE.ownerUserId})` }
+    : D365.ownerUserId ? { "ownerid@odata.bind": `/systemusers(${D365.ownerUserId})` }
+    : D365.ownerTeamId ? { "ownerid@odata.bind": `/teams(${D365.ownerTeamId})` } : {};
+  const q = await d365("POST", "/quotes", {
+    name: title,
+    ...(accountId ? { "customerid_account@odata.bind": `/accounts(${accountId})` }
+      : { "customerid_contact@odata.bind": `/contacts(${contactId})` }),
+    ...(who.opportunityId ? { "opportunityid@odata.bind": `/opportunities(${who.opportunityId})` } : {}),
+    "pricelevelid@odata.bind": `/pricelevels(${priceListId})`,
+    "transactioncurrencyid@odata.bind": `/transactioncurrencies(${QUOTE.currencyId})`,
+    ...owner,
+    description: [
+      `Created by Iris (AI assistant) for ${[first_name, last_name].filter(Boolean).join(" ")} <${email}>.`,
+      pathNote,
+      ...(who.leadId ? [`Lead: ${who.leadId}`] : []),
+      ...(who.opportunityId ? [`Opportunity: ${who.opportunityId}`] : []),
+      ...(conversation_id ? [`Conversation: ${conversation_id}`] : []),
+      ...(notes ? [`Notes: ${notes}`] : []),
+    ].join("\n").slice(0, 2000),
+  }, { Prefer: "return=representation" });
+  const quote = must(q, "quote create").json;
+
+  const lines = [];
+  const writeIns = [];
+  for (const p of products) {
+    const pn = QUOTE_PRODUCT_OVERRIDES[p.id] || p.pn;
+    const onList = await quotePriceListProduct(pn, priceListId);
+    const line = onList
+      ? { "productid@odata.bind": `/products(${onList.productId})`, "uomid@odata.bind": `/uoms(${onList.uomId})` }
+      : { isproductoverridden: true, productdescription: p.name, ispriceoverridden: true, priceperunit: p.price };
+    if (!onList) writeIns.push(p.name);
+    const d = await d365("POST", "/quotedetails", {
+      "quoteid@odata.bind": `/quotes(${quote.quoteid})`,
+      quantity: p.quantity,
+      ...line,
+      ...(p.desc || !onList ? { description: [p.desc, !onList ? "Price to confirm — product not yet on the price list." : null].filter(Boolean).join("\n") } : {}),
+    }, { Prefer: "return=representation" });
+    const row = must(d, `line ${p.name}`).json;
+    lines.push({ name: p.name, quantity: p.quantity, unit_price: row.priceperunit, amount: row.extendedamount });
+  }
+
+  // PDF(s) from the developer's templates — one per product family present.
+  const pdfNotes = [];
+  const families = [...new Set(products.map((p) => p.family))];
+  const templates = new Map();
+  for (const f of families) {
+    const t = (QUOTE_TEMPLATE_PREFIX[f] && await quoteTemplateId(QUOTE_TEMPLATE_PREFIX[f])) || await quoteTemplateId(QUOTE.defaultTemplate);
+    if (t) templates.set(t.documenttemplateid, t);
+    else pdfNotes.push(`No quote template found for ${f} products.`);
+  }
+  for (const t of templates.values()) {
+    try {
+      await attachQuotePdf(quote.quoteid, t, `${quote.quotenumber} - ${accountName}${templates.size > 1 ? ` - ${t.name}` : ""}.pdf`.replace(/[\\/:*?"<>|]/g, " "));
+    } catch (e) {
+      console.error("[iris-quote] PDF failed:", t.name, e.message);
+      pdfNotes.push(`PDF from "${t.name}" failed: ${e.message.slice(0, 200)}`);
+    }
+  }
+
+  const totals = await d365("GET", `/quotes(${quote.quoteid})?$select=totalamount,quotenumber`);
+  const total = totals.ok ? totals.json.totalamount : null;
+
+  // Review task so a rep picks it up.
+  const task = await d365("POST", "/tasks", {
+    subject: `Review & send Iris quote ${quote.quotenumber} to ${email}`.slice(0, 200),
+    description: [
+      `Iris built this quote for ${accountName} (${email}). Check the lines and the attached PDF, then send it to the customer.`,
+      pathNote,
+      ...(writeIns.length ? [`Write-in lines (not on the price list yet — confirm price): ${writeIns.join(", ")}`] : []),
+      ...pdfNotes,
+    ].join("\n"),
+    "regardingobjectid_quote@odata.bind": `/quotes(${quote.quoteid})`,
+    ...owner,
+  });
+  if (!task.ok) console.error("[iris-quote] task create failed:", task.status, task.text.slice(0, 300));
+
+  return { path: who.path, quote_number: quote.quotenumber, quote_id: quote.quoteid, total, lines, write_ins: writeIns, pdfs: templates.size, pdf_notes: pdfNotes };
+}
+
 // Browser-facing contact form on the website. Called directly from the page,
 // so it is CORS-guarded (see cors() config) rather than secret-guarded — a
 // shared secret can't live safely in page source. Reuses createOrFindLead.
@@ -780,6 +1156,59 @@ app.post("/crm/lead/update", async (req, res) => {
   } catch (e) {
     console.error("[iris-crm] update failed:", e.message);
     res.status(500).json({ status: "error", message: "CRM update failed." });
+  }
+});
+
+// ElevenLabs webhook tool "create_quote" (server-to-server, x-iris-secret).
+// Builds a draft quote in Dynamics for sales to review and send.
+app.post("/crm/quote", async (req, res) => {
+  const missing = [];
+  if (!D365.tenant)       missing.push("D365_TENANT_ID");
+  if (!D365.clientId)     missing.push("D365_CLIENT_ID");
+  if (!D365.clientSecret) missing.push("D365_CLIENT_SECRET");
+  if (!D365.orgUrl)       missing.push("D365_ORG_URL");
+  if (!D365.toolSecret)   missing.push("IRIS_TOOL_SECRET");
+  if (!QUOTE.priceListId) missing.push("QUOTE_PRICE_LIST_ID");
+  if (missing.length) return res.status(500).json({ status: "error", error: "Missing env vars", missing });
+  if (req.headers["x-iris-secret"] !== D365.toolSecret) return res.status(401).json({ error: "unauthorized" });
+
+  const b = req.body || {};
+  const email = String(b.email || "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ status: "invalid", message: "A confirmed, valid email address is required for the quote." });
+  }
+  // Items may arrive as an array or a JSON string (ElevenLabs LLM params).
+  let items = b.items;
+  if (typeof items === "string") { try { items = JSON.parse(items); } catch { items = null; } }
+  items = (Array.isArray(items) ? items : [])
+    .map((i) => ({ product: String(i && i.product || "").trim(), quantity: Math.round(Number(i && i.quantity) || 1) }));
+  const unknown = items.filter((i) => !QUOTE_PRODUCTS[i.product]).map((i) => i.product);
+  if (!items.length || unknown.length) {
+    return res.status(400).json({ status: "invalid",
+      message: unknown.length ? `Unknown product: ${unknown.join(", ")}. Use only catalog products.` : "Add at least one product to the quote." });
+  }
+  if (items.some((i) => i.quantity < 1 || i.quantity > 10000)) {
+    return res.status(400).json({ status: "invalid", message: "Each quantity must be between 1 and 10000." });
+  }
+
+  try {
+    const q = await createQuote({
+      first_name: String(b.first_name || "").trim(), last_name: String(b.last_name || "").trim(),
+      email, company: String(b.company || "").trim(), phone: b.phone,
+      customer_type: b.customer_type, items,
+      notes: b.notes ? String(b.notes).slice(0, 1000) : "", conversation_id: b.conversation_id,
+    });
+    console.log("[iris-quote] created", q.quote_number, email, "path:", q.path, "lines:", q.lines.length, "write-ins:", q.write_ins.length, "pdfs:", q.pdfs);
+    res.json({
+      status: "created",
+      quote_number: q.quote_number,
+      total: q.total,
+      lines: q.lines,
+      message: `Quote ${q.quote_number} is prepared. Tell the customer our team will review it and email it to ${email} shortly, and give the quote number as their reference. Do not read prices from this response unless asked; never mention any system.`,
+    });
+  } catch (e) {
+    console.error("[iris-quote] failed:", e.message);
+    res.status(500).json({ status: "error", message: "The quote could not be created. Tell the customer the team will follow up by email, and escalate." });
   }
 });
 
