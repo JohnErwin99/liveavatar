@@ -2,6 +2,10 @@ import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import { readFileSync as fsReadFileSync } from "fs";
+import {
+  mapLeadQualification, qualificationPatch, normalizeSegment, splitList, canonicalProduct, optionIndex,
+  stampedBlock, appendBlock, dedupeLines, quoteRequestRef, buildQuoteRequest, dcValue, buildRecapNote,
+} from "./lib/lead-qualification.js";
 
 const app = express();
 app.use(express.json({
@@ -220,6 +224,7 @@ app.get("/config", (_req, res) => res.json({
   IRIS_TOOL_SECRET:     !!D365.toolSecret,
   D365_OWNER_USER_ID:   !!D365.ownerUserId,
   D365_OWNER_TEAM_ID:   !!D365.ownerTeamId,
+  QUOTE_MODE:                   QUOTE_MODE,
   QUOTE_PRICE_LIST_ID:          !!QUOTE.priceListId,
   QUOTE_PRICE_LIST_EXISTING_ID: !!QUOTE.priceListExistingId,
   QUOTE_OWNER_USER_ID:          !!QUOTE.ownerUserId,
@@ -290,12 +295,73 @@ function buildLeadSubject(source, topic) {
   return `${prefix}${topic ? ` — ${topic}` : ""}`;
 }
 
-async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details, phone }) {
+// ---- Lead qualification columns ----
+// Customer segment (Choice) and Products of interest (Choices) are resolved by
+// LABEL from the column metadata, cached for 10 minutes, so labels can be
+// edited in Dynamics without a code change. A column that doesn't exist yet
+// (404) is skipped — its values still land in the answers block. Country,
+// job title, website and purchase timeframe (fixed 0-4) are built-in columns.
+const LEAD_CHOICES = {
+  segment:  { attr: "cr57d_customersegment",   cast: "PicklistAttributeMetadata" },
+  products: { attr: "cr57d_productsofinterest", cast: "MultiSelectPicklistAttributeMetadata" },
+};
+const CHOICE_TTL_MS = 10 * 60 * 1000;
+const choiceCache = {}; // key -> { at, idx } (idx null = column missing)
+
+async function leadChoiceOptions(keys = Object.keys(LEAD_CHOICES)) {
+  const out = {};
+  await Promise.all(keys.map(async (key) => {
+    const hit = choiceCache[key];
+    if (hit && Date.now() - hit.at < CHOICE_TTL_MS) { out[key] = hit.idx; return; }
+    const { attr, cast } = LEAD_CHOICES[key];
+    const r = await d365("GET", `/EntityDefinitions(LogicalName='lead')/Attributes(LogicalName='${attr}')/Microsoft.Dynamics.CRM.${cast}` +
+      `?$select=LogicalName&$expand=OptionSet($select=Options),GlobalOptionSet($select=Options)`);
+    if (r.ok) {
+      const set = (r.json.OptionSet && r.json.OptionSet.Options) ? r.json.OptionSet : r.json.GlobalOptionSet;
+      out[key] = optionIndex(set && set.Options);
+      choiceCache[key] = { at: Date.now(), idx: out[key] };
+    } else if (r.status === 404) {
+      console.warn(`[iris-crm] lead column ${attr} not found — skipped, values kept in the answers block`);
+      out[key] = null;
+      choiceCache[key] = { at: Date.now(), idx: null };
+    } else {
+      // Transient: skip the column for this request only, don't cache.
+      console.warn(`[iris-crm] option lookup ${attr} failed:`, r.status, r.text.slice(0, 200));
+      out[key] = null;
+    }
+  }));
+  return out;
+}
+
+// { country, segment, products, job_title, website, timeline, account_path }
+// -> { fields (lead columns), lines (answers), productValues, options, ... }.
+// Metadata is only read when a segment or products were given.
+async function leadQualificationFields(q) {
+  if (!q) return null;
+  const keys = [
+    ...(normalizeSegment(q.segment) ? ["segment"] : []),
+    ...(splitList(q.products).length ? ["products"] : []),
+  ];
+  const options = keys.length ? await leadChoiceOptions(keys) : {};
+  return { ...mapLeadQualification(q, options), options };
+}
+
+async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details, phone, qualification }) {
   const token = await getD365Token();
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
+  // Qualification answers -> lead columns + readable lines for the answers block.
+  const qual = await leadQualificationFields(qualification);
+  const answerLines = dedupeLines([...(qual ? qual.lines : []), ...(details || [])]);
+  // Only select choice columns that exist — $select on a missing column is a 400.
+  const qualCols = [
+    "address1_country", "jobtitle", "websiteurl", "purchasetimeframe",
+    ...(qual && qual.options.segment ? ["cr57d_customersegment"] : []),
+    ...(qual && qual.options.products ? ["cr57d_productsofinterest"] : []),
+  ];
+
   const safeEmail = email.replace(/'/g, "''");
-  const q = `${api}/leads?$select=leadid,subject,firstname,lastname,telephone1,companyname,cr57d_topicofinterest,cr57d_formanswers,cr57d_conversationid&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
+  const q = `${api}/leads?$select=leadid,subject,firstname,lastname,telephone1,companyname,cr57d_topicofinterest,cr57d_formanswers,cr57d_conversationid,${qualCols.join(",")}&$filter=emailaddress1 eq '${safeEmail}' and statecode eq 0&$top=1`;
   const dupRes = await fetch(q, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
   const dup = await dupRes.json();
   if (dupRes.ok && dup.value && dup.value.length) {
@@ -319,18 +385,20 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
     if (conversation_id && conversation_id !== existing.cr57d_conversationid) {
       patch.cr57d_conversationid = conversation_id;
     }
-    // Always leave a stamped trace of the repeat contact in the answers history.
-    const traceLines = [...(details || [])];
-    if (conversation_id && conversation_id !== existing.cr57d_conversationid) {
-      traceLines.push(`New conversation: ${conversation_id}`);
+    // Qualification: newest value wins (with a history line when it changes),
+    // products of interest are merged with what the lead already has.
+    const history = [];
+    if (qual) {
+      const qp = qualificationPatch(existing, qual);
+      Object.assign(patch, qp.patch);
+      history.push(...qp.history);
     }
-    if (topic && topic !== existing.cr57d_topicofinterest) {
-      traceLines.push(`Topic: ${topic}`);
-    }
-    if (traceLines.length) {
-      const stamp = `--- ${source} ${new Date().toISOString().slice(0, 16)} ---`;
-      const prev = existing.cr57d_formanswers ? existing.cr57d_formanswers + "\n\n" : "";
-      patch.cr57d_formanswers = (prev + stamp + "\n" + traceLines.join("\n")).slice(-4000);
+    // Append a readable stamped block for this submission: when, where from,
+    // what they asked for, the answers. The conversation id is not traced here
+    // — it lives in cr57d_conversationid.
+    const blockLines = [...answerLines, ...history];
+    if (blockLines.length || (topic && topic !== existing.cr57d_topicofinterest)) {
+      patch.cr57d_formanswers = appendBlock(existing.cr57d_formanswers, stampedBlock({ source, topic, lines: blockLines }));
     }
 
     if (Object.keys(patch).length) {
@@ -357,7 +425,7 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
   const subject = buildLeadSubject(source, topic);
   const origin =
     source === "mailchimp" ? "Captured from Mailchimp landing page" :
-    source === "website-form" ? "Captured from website pricing form" :
+    source === "website-form" ? "Captured from website contact form" :
     "Captured by Iris (AI assistant) on iristel.com";
 
   const create = await fetch(`${api}/leads`, {
@@ -387,9 +455,11 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
       cr57d_leadsourcedetail: source,                               // "iris" | "mailchimp" | ...
       ...(topic ? { cr57d_topicofinterest: topic.slice(0, 250) } : {}),
       ...(conversation_id ? { cr57d_conversationid: conversation_id } : {}),
-      ...(details && details.length
-        ? { cr57d_formanswers: details.join("\n").slice(0, 4000) } : {}),
+      ...(answerLines.length
+        ? { cr57d_formanswers: appendBlock("", stampedBlock({ source, topic, lines: answerLines })) } : {}),
       cr57d_capturedon: new Date().toISOString(),
+      // Country, job title, website, purchase timeframe, segment, products.
+      ...(qual ? qual.fields : {}),
     }),
   });
   if (!create.ok) throw new Error(`D365 create ${create.status}: ${await create.text()}`);
@@ -527,6 +597,11 @@ const QUOTE = {
   ownerUserId:         process.env.QUOTE_OWNER_USER_ID || "",
   defaultTemplate:     process.env.QUOTE_DEFAULT_TEMPLATE || "Print quote for customer",
 };
+// QUOTE_MODE=lead (default): create_quote saves a quote REQUEST on the lead
+// (or on an existing customer's contact) and sales prepares and emails the
+// quote — no conversion, no quote record, no PDF, no task.
+// QUOTE_MODE=quote: the original builder below (createQuote), kept for rollback.
+const QUOTE_MODE = String(process.env.QUOTE_MODE || "lead").trim().toLowerCase() === "quote" ? "quote" : "lead";
 // Testing only: {"sc_pro_new":"TEST-PRD-01", ...} points catalog ids at other
 // D365 product numbers until the real products are published.
 const QUOTE_PRODUCT_OVERRIDES = (() => {
@@ -601,6 +676,9 @@ async function d365(method, path, body, headers) {
   return { ok: r.ok, status: r.status, json, text };
 }
 const odq = (s) => String(s).replace(/'/g, "''");
+// Value for contains(): Dataverse runs it as SQL LIKE, so [ _ % are wildcards
+// unless bracketed ("[conv:x]" unescaped matches ANY of those characters).
+const likeq = (s) => odq(s).replace(/[[_%]/g, "[$&]");
 const must = (r, what) => { if (!r.ok) throw new Error(`${what}: ${r.status} ${r.text.slice(0, 300)}`); return r; };
 
 // MIND account -> CRM fields. The email lookup's field names are mapped
@@ -886,6 +964,33 @@ async function createQuote({ first_name, last_name, email, company, phone, custo
   return { path: who.path, quote_number: quote.quotenumber, quote_id: quote.quoteid, total, lines, write_ins: writeIns, pdfs: templates.size, pdf_notes: pdfNotes };
 }
 
+// QUOTE_MODE=lead: the quote request (products × quantity, catalog prices,
+// monthly and one-time totals, customer details, reference) is appended to
+// the prospect's open lead — or, for an existing MIND customer, recorded as a
+// note on their contact (customers never become leads).
+async function createQuoteRequest({ first_name, last_name, email, company, phone, customer_type, items, notes, conversation_id, country, customer_segment, account_path }) {
+  const ref = quoteRequestRef();
+  const mind = await lookupMindAccount(email);
+  const request = buildQuoteRequest({
+    items, catalog: QUOTE_PRODUCTS, existing: customer_type === "existing" || !!mind,
+    company, country, segment: customer_segment, account_path, notes, ref,
+  });
+  const topic = `Quote request — ${request.productNames.join(", ")}`.slice(0, 250);
+
+  if (mind) {
+    const c = await upsertCustomerContact({
+      first_name, last_name, email, company, topic, phone, details: request.lines, conversation_id, mind,
+    });
+    return { ref, path: "customer", id: c.contactid, ...request };
+  }
+  const lead = await createOrFindLead({
+    first_name: first_name || "(not provided)", last_name, email, company, phone, topic,
+    conversation_id, source: "iris", details: request.lines,
+    qualification: { country, segment: customer_segment, products: request.productLabels },
+  });
+  return { ref, path: "lead", id: lead.leadid, ...request };
+}
+
 // Browser-facing contact form on the website. Called directly from the page,
 // so it is CORS-guarded (see cors() config) rather than secret-guarded — a
 // shared secret can't live safely in page source. Reuses createOrFindLead.
@@ -895,29 +1000,49 @@ app.post("/crm/website-lead", async (req, res) => {
   if (!D365.orgUrl)   missing.push("D365_ORG_URL");
   if (missing.length) return res.status(500).json({ status: "error", message: "CRM not configured." });
 
-  // The pricing-page form sends: first_name, last_name, email, phone, company,
-  // product (the dropdown), message. Map product -> topic.
-  const { first_name, last_name, email, company, phone, message } = req.body || {};
-  const topic = (req.body && (req.body.topic || req.body.product) || "").trim();
+  // The contact form ("Tell us what you need", form_version 2026-10-19) sends:
+  // first_name, last_name, email, phone, company, job_title, website, country,
+  // customer_segment (enterprise | wholesale), product (one solution label),
+  // company_size, industry, timeline, company_type, monthly_traffic,
+  // destinations, message. Older payloads (first_name, last_name, email,
+  // phone, company, product, message) keep working. Map product -> topic.
+  const b = req.body || {};
+  const { first_name, last_name, email, company, phone, message } = b;
+  const product = String(b.topic || b.product || "").trim();
+  const topic = canonicalProduct(product) || product;
   if (!first_name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ status: "invalid", message: "Please provide your name and a valid email." });
   }
 
-  // Fold phone + free-text message into the form-answers field.
+  // Country, segment, solution, job title, website and timeline go to lead
+  // columns. "Who will use these services?" is the account-fit question:
+  // own organization = Enterprise – Direct, their customers = Wholesale.
+  const segment = normalizeSegment(b.customer_segment);
+  const qualification = {
+    country: b.country, segment, products: product, job_title: b.job_title, website: b.website, timeline: b.timeline,
+    account_path: segment === "enterprise" ? "Enterprise – Direct" : segment === "wholesale" ? "Wholesale" : "",
+  };
+  // Everything else is a labeled line in the form-answers block.
   const details = [];
-  if (phone && String(phone).trim())   details.push(`Phone: ${String(phone).trim()}`);
-  if (message && String(message).trim()) details.push(`Message: ${String(message).trim()}`);
+  const answer = (label, v) => { const s = v == null ? "" : String(v).trim(); if (s) details.push(`${label}: ${s.slice(0, 2000)}`); };
+  answer("Phone", phone);
+  answer("Company size", b.company_size);
+  answer("Industry", b.industry);
+  answer("Company type", b.company_type);
+  answer("Monthly voice traffic", b.monthly_traffic);
+  answer("Key destinations", b.destinations);
+  answer("Message", message);
 
   try {
     const r = await createOrFindLead({
       first_name, last_name, email, company, topic, phone,
-      source: "website-form", details,
+      source: "website-form", details, qualification,
     });
     // Return statuses the form's success check accepts ("created" | "exists").
     if (r.status === "exists") {
       return res.json({ status: "exists", message: `Thanks ${r.first_name}, we already have your details — our team will be in touch.` });
     }
-    console.log("[iris-web] lead created:", r.leadid, email, "topic:", topic || "-");
+    console.log("[iris-web] lead created:", r.leadid, email, "topic:", topic || "-", "form:", b.form_version || "legacy");
     res.json({ status: "created", message: "Thanks! Our team will reach out shortly with pricing." });
   } catch (e) {
     console.error("[iris-web] failed:", e.message);
@@ -1058,6 +1183,17 @@ app.post("/crm/marketplace-lead", async (req, res) => {
   }
 });
 
+// Qualification fields sent by the create_lead / update_lead tools (all optional):
+// country, customer_segment (enterprise | wholesale | unknown),
+// products_of_interest (comma list of product names), account_path, job_title.
+function irisQualification(b) {
+  b = b || {};
+  return {
+    country: b.country, segment: b.customer_segment, products: b.products_of_interest,
+    account_path: b.account_path, job_title: b.job_title,
+  };
+}
+
 app.post("/crm/lead", async (req, res) => {
   const missing = [];
   if (!D365.tenant)       missing.push("D365_TENANT_ID");
@@ -1088,13 +1224,19 @@ app.post("/crm/lead", async (req, res) => {
   const details = typeof req.body?.details === "string"
     ? req.body.details.split("\n").map(s => s.trim()).filter(Boolean)
     : Array.isArray(req.body?.details) ? req.body.details : [];
+  // Account fit (Step A): country, segment, products, account path, job title.
+  const qualification = irisQualification(req.body);
 
   try {
     // Existing MIND account = existing CUSTOMER: never create a lead for them.
-    // Record the interaction on a Contact under their Account instead.
+    // Record the interaction on a Contact under their Account instead, with
+    // the qualification answers as lines in the note.
     const mind = await lookupMindAccount(email);
     if (mind) {
-      const c = await upsertCustomerContact({ first_name, last_name, email, company, topic, phone, details, conversation_id, mind });
+      const c = await upsertCustomerContact({
+        first_name, last_name, email, company, topic, phone, conversation_id, mind,
+        details: dedupeLines([...mapLeadQualification(qualification).lines, ...details]),
+      });
       console.log("[iris-crm] customer contact:", c.contactid, email, "account:", c.account_name || "-");
       return res.json({
         status: "customer",
@@ -1104,7 +1246,7 @@ app.post("/crm/lead", async (req, res) => {
       });
     }
 
-    const r = await createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, phone, source: "iris", details });
+    const r = await createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, phone, source: "iris", details, qualification });
     if (r.status === "exists") {
       console.log("[iris-crm] returning customer:", email, "->", r.full_name);
       return res.json({
@@ -1149,6 +1291,7 @@ app.post("/crm/lead/update", async (req, res) => {
     const r = await createOrFindLead({
       first_name: first_name || "(not provided)", last_name, email, company,
       topic, conversation_id, phone, source: "iris", details,
+      qualification: irisQualification(req.body),
     });
     const status = r.status === "exists" ? "updated" : "created";
     console.log("[iris-crm] lead update:", status, email, "details:", details.length);
@@ -1160,7 +1303,9 @@ app.post("/crm/lead/update", async (req, res) => {
 });
 
 // ElevenLabs webhook tool "create_quote" (server-to-server, x-iris-secret).
-// Builds a draft quote in Dynamics for sales to review and send.
+// QUOTE_MODE=lead (default): saves a quote request on the lead for sales to
+// prepare and email. QUOTE_MODE=quote: builds a draft quote in Dynamics for
+// sales to review and send.
 app.post("/crm/quote", async (req, res) => {
   const missing = [];
   if (!D365.tenant)       missing.push("D365_TENANT_ID");
@@ -1168,7 +1313,7 @@ app.post("/crm/quote", async (req, res) => {
   if (!D365.clientSecret) missing.push("D365_CLIENT_SECRET");
   if (!D365.orgUrl)       missing.push("D365_ORG_URL");
   if (!D365.toolSecret)   missing.push("IRIS_TOOL_SECRET");
-  if (!QUOTE.priceListId) missing.push("QUOTE_PRICE_LIST_ID");
+  if (QUOTE_MODE === "quote" && !QUOTE.priceListId) missing.push("QUOTE_PRICE_LIST_ID");
   if (missing.length) return res.status(500).json({ status: "error", error: "Missing env vars", missing });
   if (req.headers["x-iris-secret"] !== D365.toolSecret) return res.status(401).json({ error: "unauthorized" });
 
@@ -1189,6 +1334,28 @@ app.post("/crm/quote", async (req, res) => {
   }
   if (items.some((i) => i.quantity < 1 || i.quantity > 10000)) {
     return res.status(400).json({ status: "invalid", message: "Each quantity must be between 1 and 10000." });
+  }
+
+  if (QUOTE_MODE === "lead") {
+    try {
+      const r = await createQuoteRequest({
+        first_name: String(b.first_name || "").trim(), last_name: String(b.last_name || "").trim(),
+        email, company: String(b.company || "").trim(), phone: b.phone,
+        customer_type: b.customer_type, items,
+        notes: b.notes ? String(b.notes).slice(0, 1000) : "", conversation_id: b.conversation_id,
+        country: b.country, customer_segment: b.customer_segment, account_path: b.account_path,
+      });
+      console.log("[iris-quote] request saved", r.ref, email, "path:", r.path, "lines:", items.length,
+        "monthly:", r.monthlyTotal, "one-time:", r.oneTimeTotal);
+      return res.json({
+        status: "created",
+        quote_number: r.ref,
+        message: `Quote request ${r.ref} is saved. Tell the customer our team will prepare the quote and email it to ${email} shortly, and give ${r.ref} as their reference. Never mention any system.`,
+      });
+    } catch (e) {
+      console.error("[iris-quote] request failed:", e.message);
+      return res.status(500).json({ status: "error", message: "The quote request could not be saved. Tell the customer the team will follow up by email, and escalate." });
+    }
   }
 
   try {
@@ -1532,10 +1699,13 @@ app.post("/nda/status", async (req, res) => {
   }
 });
 
-// ---- ElevenLabs post-call webhook: attach the transcript to the lead ----
+// ---- ElevenLabs post-call webhook: attach Iris's sales recap ----
 // Enable in ElevenLabs: Agents settings > Webhooks > post_call_transcription,
 // pointing at POST /webhooks/elevenlabs. Store the generated HMAC secret in
 // ELEVENLABS_WEBHOOK_SECRET.
+// The note comes from the agent's data collection (country, customer_segment,
+// products_of_interest, sales_recap), not the generic transcript_summary,
+// which carries widget/system noise.
 
 function verifyElevenLabsSignature(req) {
   if (!EL_WEBHOOK_SECRET) return false;
@@ -1570,70 +1740,85 @@ app.post("/webhooks/elevenlabs", async (req, res) => {
     const convId = data.conversation_id;
     if (!convId) return;
 
-    // Attach the AI-generated summary only — not the full transcript.
-    const summary = data.analysis?.transcript_summary || "";
-    const durationSecs = data.metadata?.call_duration_secs;
-
-    // Nothing worth attaching if there's no summary.
-    if (!summary) {
-      console.log("[iris-crm] webhook: no summary for conversation", convId, "— skipping note");
+    const dc = data.analysis?.data_collection_results || {};
+    const country = dcValue(dc, "country");
+    const segment = dcValue(dc, "customer_segment");
+    const products = dcValue(dc, "products_of_interest");
+    const startSecs = Number(data.metadata?.start_time_unix_secs);
+    // "Iris recap — <date> (<duration>)", a fields line, the recap. Null when
+    // sales_recap is empty.
+    const note = buildRecapNote({
+      at: startSecs ? new Date(startSecs * 1000) : new Date(),
+      durationSecs: data.metadata?.call_duration_secs,
+      country, segment, products, recap: dcValue(dc, "sales_recap"), conversationId: convId,
+    });
+    if (!note && !country && !normalizeSegment(segment) && !products) {
+      console.log("[iris-crm] webhook: no recap or fields for conversation", convId, "— skipping");
       return;
     }
-
-    let noteText =
-      `SUMMARY\n${summary}` +
-      (durationSecs ? `\n\nDuration: ${Math.round(durationSecs / 60)} min ${durationSecs % 60} s` : "");
-    // Annotation notetext is capped; keep a wide margin.
-    if (noteText.length > 90000) noteText = noteText.slice(0, 90000) + "\n[truncated]";
-
-    const token = await getD365Token();
-    const api = `${D365.orgUrl}/api/data/v9.2`;
 
     // Find the lead stamped with this conversation id.
     // Prefer the structured field; fall back to the legacy [conv:] description tag
     // for leads created before the field migration.
-    const safeConv = String(convId).replace(/'/g, "''");
-    const q = `${api}/leads?$select=leadid&$filter=` +
-      `cr57d_conversationid eq '${safeConv}' or contains(description,'[conv:${safeConv}]')&$top=1`;
-    const found = await (await fetch(q, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-    })).json();
+    const safeConv = odq(convId);
+    const likeConv = likeq(convId);
+    const qual = await leadQualificationFields({ country, segment, products });
+    const cols = [
+      "leadid", "address1_country",
+      ...(qual.options.segment ? ["cr57d_customersegment"] : []),
+      ...(qual.options.products ? ["cr57d_productsofinterest"] : []),
+    ];
+    const found = await d365("GET", `/leads?$select=${cols.join(",")}&$filter=` +
+      `cr57d_conversationid eq '${safeConv}' or contains(description,'${likeq("[conv:")}${likeConv}]')&$top=1`);
+    const lead = found.ok && found.json.value[0];
 
-    if (!found.value || !found.value.length) {
-      console.log("[iris-crm] webhook: no lead for conversation", convId);
+    let target = null;
+    if (lead) {
+      target = { entity: "lead", id: lead.leadid };
+      // Fill only EMPTY lead fields from the call; products are merged.
+      const { patch } = qualificationPatch(lead, qual, { fillOnly: true });
+      if (Object.keys(patch).length) {
+        const up = await d365("PATCH", `/leads(${lead.leadid})`, patch, { "If-Match": "*" });
+        if (!up.ok) console.error("[iris-crm] webhook: lead fill failed:", up.status, up.text.slice(0, 300));
+        else console.log("[iris-crm] webhook: lead filled:", lead.leadid, "fields:", Object.keys(patch).join(","));
+      }
+    } else {
+      // Existing customers never get a lead: find the contact whose Iris
+      // note (upsertCustomerContact) holds this conversation id.
+      const a = await d365("GET", `/annotations?$select=_objectid_value&$filter=objecttypecode eq 'contact' and ` +
+        `contains(notetext,'Conversation: ${likeConv}')&$orderby=createdon desc&$top=1`);
+      const hit = a.ok && a.json.value[0];
+      if (hit && hit._objectid_value) target = { entity: "contact", id: hit._objectid_value };
+    }
+
+    if (!target) {
+      console.log("[iris-crm] webhook: no lead or customer contact for conversation", convId);
       return;
     }
-    const leadId = found.value[0].leadid;
+    if (!note) {
+      console.log("[iris-crm] webhook: no sales recap for conversation", convId, "— skipping note");
+      return;
+    }
 
-    // Idempotency: retried webhook deliveries must not duplicate the note.
-    const dupQ = `${api}/annotations?$select=annotationid&$filter=_objectid_value eq ${leadId} and subject eq 'Iris conversation ${convId}'&$top=1`;
-    const dup = await (await fetch(dupQ, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-    })).json();
-    if (dup.value && dup.value.length) {
+    // Idempotency: retried webhook deliveries must not duplicate the note
+    // (legacy "Iris conversation <id>" summaries count too).
+    const dup = await d365("GET", `/annotations?$select=annotationid&$filter=_objectid_value eq ${target.id} and ` +
+      `(subject eq 'Iris conversation ${safeConv}' or (startswith(subject,'Iris recap') and contains(notetext,'Conversation: ${likeConv}')))&$top=1`);
+    if (dup.ok && dup.json.value.length) {
       console.log("[iris-crm] webhook: note already attached for", convId);
       return;
     }
 
-    const note = await fetch(`${api}/annotations`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        subject: `Iris conversation ${convId}`,
-        notetext: noteText,
-        "objectid_lead@odata.bind": `/leads(${leadId})`,
-      }),
+    const created = await d365("POST", "/annotations", {
+      subject: note.subject,
+      notetext: note.notetext,
+      [`objectid_${target.entity}@odata.bind`]: `/${target.entity}s(${target.id})`,
     });
-
-    if (!note.ok) {
-      console.error("[iris-crm] webhook: note create failed:", note.status, await note.text());
+    if (!created.ok) {
+      console.error("[iris-crm] webhook: note create failed:", created.status, created.text.slice(0, 300));
       return;
     }
-    console.log("[iris-crm] webhook: transcript attached to lead", leadId, "conv", convId);
+    console.log("[iris-crm] webhook: recap attached to", target.entity, target.id, "conv", convId);
   } catch (e) {
     console.error("[iris-crm] webhook processing failed:", e.message);
   }

@@ -6,6 +6,7 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "start": "node server.js",
+    "test": "node test/lead-qualification.test.js",
     "register-secret": "node register-secret.js"
   },
   "dependencies": {
