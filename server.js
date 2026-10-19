@@ -5,6 +5,7 @@ import { readFileSync as fsReadFileSync } from "fs";
 import {
   mapLeadQualification, qualificationPatch, normalizeSegment, splitList, canonicalProduct, optionIndex,
   stampedBlock, appendBlock, dedupeLines, quoteRequestRef, buildQuoteRequest, dcValue, buildRecapNote,
+  timelineFromDetails,
 } from "./lib/lead-qualification.js";
 
 const app = express();
@@ -314,8 +315,16 @@ async function leadChoiceOptions(keys = Object.keys(LEAD_CHOICES)) {
     const hit = choiceCache[key];
     if (hit && Date.now() - hit.at < CHOICE_TTL_MS) { out[key] = hit.idx; return; }
     const { attr, cast } = LEAD_CHOICES[key];
-    const r = await d365("GET", `/EntityDefinitions(LogicalName='lead')/Attributes(LogicalName='${attr}')/Microsoft.Dynamics.CRM.${cast}` +
-      `?$select=LogicalName&$expand=OptionSet($select=Options),GlobalOptionSet($select=Options)`);
+    let r;
+    try {
+      r = await d365("GET", `/EntityDefinitions(LogicalName='lead')/Attributes(LogicalName='${attr}')/Microsoft.Dynamics.CRM.${cast}` +
+        `?$select=LogicalName&$expand=OptionSet($select=Options),GlobalOptionSet($select=Options)`);
+    } catch (e) {
+      // Network error: skip the column for this request only, don't cache.
+      console.warn(`[iris-crm] option lookup ${attr} failed:`, e.message);
+      out[key] = null;
+      return;
+    }
     if (r.ok) {
       const set = (r.json.OptionSet && r.json.OptionSet.Options) ? r.json.OptionSet : r.json.GlobalOptionSet;
       out[key] = optionIndex(set && set.Options);
@@ -346,7 +355,9 @@ async function leadQualificationFields(q) {
   return { ...mapLeadQualification(q, options), options };
 }
 
-async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details, phone, qualification }) {
+// strict: a failed update of an existing lead throws instead of only logging
+// (quote requests — Iris must not confirm a request that wasn't saved).
+async function createOrFindLead({ first_name, last_name, email, company, topic, conversation_id, source, details, phone, qualification, strict = false }) {
   const token = await getD365Token();
   const api = `${D365.orgUrl}/api/data/v9.2`;
 
@@ -412,8 +423,11 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
         },
         body: JSON.stringify(patch),
       });
-      if (!up.ok) console.error("[iris-crm] lead update failed:", up.status, await up.text());
-      else console.log("[iris-crm] lead updated:", existing.leadid, "fields:", Object.keys(patch).join(","));
+      if (!up.ok) {
+        const t = await up.text();
+        if (strict) throw new Error(`D365 lead update ${up.status}: ${t.slice(0, 300)}`);
+        console.error("[iris-crm] lead update failed:", up.status, t);
+      } else console.log("[iris-crm] lead updated:", existing.leadid, "fields:", Object.keys(patch).join(","));
     }
 
     const knownFirst = patch.firstname || existing.firstname || first_name;
@@ -495,7 +509,8 @@ async function lookupMindAccount(email) {
 // hang it off the Account named after the MIND account, and record the
 // interaction (topic + discovery details) as an annotation on the contact —
 // the customer-side equivalent of cr57d_formanswers on a lead.
-async function upsertCustomerContact({ first_name, last_name, email, company, topic, phone, details, conversation_id, mind }) {
+// strict: a failed note throws instead of only logging (quote requests).
+async function upsertCustomerContact({ first_name, last_name, email, company, topic, phone, details, conversation_id, mind, strict = false }) {
   const token = await getD365Token();
   const api = `${D365.orgUrl}/api/data/v9.2`;
   const H = {
@@ -579,7 +594,11 @@ async function upsertCustomerContact({ first_name, last_name, email, company, to
         "objectid_contact@odata.bind": `/contacts(${contactId})`,
       }),
     });
-    if (!note.ok) console.error("[iris-crm] annotation failed:", note.status, await note.text());
+    if (!note.ok) {
+      const t = await note.text();
+      if (strict) throw new Error(`D365 annotation ${note.status}: ${t.slice(0, 300)}`);
+      console.error("[iris-crm] annotation failed:", note.status, t);
+    }
   }
 
   return { status: "customer", contactid: contactId, account_name: accountName };
@@ -967,7 +986,8 @@ async function createQuote({ first_name, last_name, email, company, phone, custo
 // QUOTE_MODE=lead: the quote request (products × quantity, catalog prices,
 // monthly and one-time totals, customer details, reference) is appended to
 // the prospect's open lead — or, for an existing MIND customer, recorded as a
-// note on their contact (customers never become leads).
+// note on their contact (customers never become leads). Both writes are
+// strict: if the block isn't saved, /crm/quote answers 500 and Iris escalates.
 async function createQuoteRequest({ first_name, last_name, email, company, phone, customer_type, items, notes, conversation_id, country, customer_segment, account_path }) {
   const ref = quoteRequestRef();
   const mind = await lookupMindAccount(email);
@@ -979,14 +999,14 @@ async function createQuoteRequest({ first_name, last_name, email, company, phone
 
   if (mind) {
     const c = await upsertCustomerContact({
-      first_name, last_name, email, company, topic, phone, details: request.lines, conversation_id, mind,
+      first_name, last_name, email, company, topic, phone, details: request.lines, conversation_id, mind, strict: true,
     });
     return { ref, path: "customer", id: c.contactid, ...request };
   }
   const lead = await createOrFindLead({
     first_name: first_name || "(not provided)", last_name, email, company, phone, topic,
     conversation_id, source: "iris", details: request.lines,
-    qualification: { country, segment: customer_segment, products: request.productLabels },
+    qualification: { country, segment: customer_segment, products: request.productLabels }, strict: true,
   });
   return { ref, path: "lead", id: lead.leadid, ...request };
 }
@@ -1186,11 +1206,18 @@ app.post("/crm/marketplace-lead", async (req, res) => {
 // Qualification fields sent by the create_lead / update_lead tools (all optional):
 // country, customer_segment (enterprise | wholesale | unknown),
 // products_of_interest (comma list of product names), account_path, job_title.
-function irisQualification(b) {
+// Timing (Step C) arrives as a "Timing: …" line in details; it is taken out of
+// the details and mapped to Purchase Timeframe. -> { qualification, details }.
+function irisQualification(b, details = []) {
   b = b || {};
+  const explicit = String(b.timeline || "").trim();
+  const t = explicit ? { timeline: explicit, rest: details } : timelineFromDetails(details);
   return {
-    country: b.country, segment: b.customer_segment, products: b.products_of_interest,
-    account_path: b.account_path, job_title: b.job_title,
+    qualification: {
+      country: b.country, segment: b.customer_segment, products: b.products_of_interest,
+      account_path: b.account_path, job_title: b.job_title, timeline: t.timeline,
+    },
+    details: t.rest,
   };
 }
 
@@ -1221,11 +1248,12 @@ app.post("/crm/lead", async (req, res) => {
   // Discovery-survey answers arrive as one newline-separated string from the
   // ElevenLabs tool; split into the lines createOrFindLead appends to
   // cr57d_formanswers (arrays accepted too, for parity with the other routes).
-  const details = typeof req.body?.details === "string"
+  const rawDetails = typeof req.body?.details === "string"
     ? req.body.details.split("\n").map(s => s.trim()).filter(Boolean)
     : Array.isArray(req.body?.details) ? req.body.details : [];
-  // Account fit (Step A): country, segment, products, account path, job title.
-  const qualification = irisQualification(req.body);
+  // Account fit (Step A): country, segment, products, account path, job title;
+  // Step C timing from a "Timing:" details line.
+  const { qualification, details } = irisQualification(req.body, rawDetails);
 
   try {
     // Existing MIND account = existing CUSTOMER: never create a lead for them.
@@ -1283,15 +1311,27 @@ app.post("/crm/lead/update", async (req, res) => {
     });
   }
 
-  const details = typeof req.body?.details === "string"
+  const rawDetails = typeof req.body?.details === "string"
     ? req.body.details.split("\n").map(s => s.trim()).filter(Boolean)
     : Array.isArray(req.body?.details) ? req.body.details : [];
+  const { qualification, details } = irisQualification(req.body, rawDetails);
 
   try {
+    // Same rule as /crm/lead: an existing MIND customer never becomes a lead —
+    // later discovery answers go on their Contact as a note.
+    const mind = await lookupMindAccount(email);
+    if (mind) {
+      await upsertCustomerContact({
+        first_name: first_name || "(not provided)", last_name, email, company, topic, phone, conversation_id, mind,
+        details: dedupeLines([...mapLeadQualification(qualification).lines, ...details]),
+      });
+      console.log("[iris-crm] lead update: customer contact", email, "details:", details.length);
+      return res.json({ status: "updated", message: "Contact information saved." });
+    }
+
     const r = await createOrFindLead({
       first_name: first_name || "(not provided)", last_name, email, company,
-      topic, conversation_id, phone, source: "iris", details,
-      qualification: irisQualification(req.body),
+      topic, conversation_id, phone, source: "iris", details, qualification,
     });
     const status = r.status === "exists" ? "updated" : "created";
     console.log("[iris-crm] lead update:", status, email, "details:", details.length);

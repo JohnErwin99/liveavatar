@@ -4,7 +4,7 @@ import assert from "assert/strict";
 import { readFileSync } from "fs";
 import {
   PRODUCT_LABELS, OTHER_PRODUCT, normLabel, canonicalProduct, splitList, parseProducts, normalizeSegment,
-  timelineToTimeframe, optionIndex, parseMultiSelect, unionMultiSelect, mapLeadQualification,
+  timelineToTimeframe, timelineFromDetails, optionIndex, parseMultiSelect, unionMultiSelect, mapLeadQualification,
   qualificationPatch, fmtStamp, fmtDate, dedupeLines, stampedBlock, appendBlock, quoteRequestRef,
   quoteBilling, quoteProductLabel, money, buildQuoteRequest, dcValue, fmtDuration, normalizeRecap, buildRecapNote,
 } from "../lib/lead-qualification.js";
@@ -95,6 +95,27 @@ test("timeline labels map to purchasetimeframe 0-4", () => {
   for (const [raw, want] of Object.entries(cases)) assert.equal(timelineToTimeframe(raw), want, raw);
   assert.equal(timelineToTimeframe(""), undefined);
   assert.equal(timelineToTimeframe("whenever"), undefined);
+});
+
+test("Iris 'Timing:' details line -> timeline, line taken out of the details", () => {
+  const details = ["SIP — PBX/SBC: 3CX 18", "Timing: Exploring / no fixed date", "Could stop it: budget"];
+  const t = timelineFromDetails(details);
+  assert.equal(t.timeline, "Exploring / no fixed date");
+  assert.deepEqual(t.rest, ["SIP — PBX/SBC: 3CX 18", "Could stop it: budget"]);
+  const q = mapLeadQualification({ timeline: t.timeline });
+  assert.equal(q.fields.purchasetimeframe, 4);
+  assert.deepEqual(q.lines, ["Timeline: Exploring / no fixed date"]);
+  // "Timeline:" works too, case-insensitive; the last one wins and only it is removed.
+  const t2 = timelineFromDetails(["timing: 6+ months", "TIMELINE:  Within 3-6 months "]);
+  assert.equal(t2.timeline, "Within 3-6 months");
+  assert.equal(timelineToTimeframe(t2.timeline), 2);
+  assert.deepEqual(t2.rest, ["timing: 6+ months"]);
+  // No timing line, an empty one, or a module-prefixed label -> nothing taken.
+  for (const d of [[], undefined, ["Timing:"], ["Must be true: Timing: sign by Q1"], ["SIP — Timing: soon"]]) {
+    const r = timelineFromDetails(d);
+    assert.equal(r.timeline, "");
+    assert.deepEqual(r.rest, d || []);
+  }
 });
 
 // ---- option index / multi-select ----
@@ -377,6 +398,42 @@ test("recap note: no fields line when nothing known, null when recap empty", () 
   assert.equal(note.notetext, "Asked about pricing.");
   assert.equal(buildRecapNote({ recap: "   ", country: "Canada" }), null);
   assert.equal(buildRecapNote({ recap: undefined }), null);
+});
+
+test("recap note: 'No sales conversation' wording gives no note", () => {
+  assert.equal(buildRecapNote({ recap: "No sales conversation" }), null);
+  assert.equal(buildRecapNote({ recap: "No sales conversation." }), null);
+  assert.ok(buildRecapNote({ recap: "No sales conversation yet, asked about 911 address." }));
+});
+
+test("legacy contact-form product names map to canonical labels", () => {
+  for (const [legacy, label] of [
+    ["Cloud Connect for Webex", "Unified communications / Cloud Connect"],
+    ["Smart Manager", "Microsoft Teams calling (Operator Connect)"],
+    ["Virtual Fax", "Cloud calling / Hosted PBX"],
+    ["IP Phones", "Cloud calling / Hosted PBX"],
+    ["Managed EDR", "Managed cybersecurity"],
+    ["Managed SIEM", "Managed cybersecurity"],
+    ["Cybersecurity Awareness Training", "Managed cybersecurity"],
+    ["Vulnerability Assessment", "Managed cybersecurity"],
+    ["Cybersecurity Consulting", "Managed cybersecurity"],
+    ["Cybersecurity (General)", "Managed cybersecurity"],
+    ["Wholesale SIP Trunking", "Wholesale voice termination"],
+    ["Infrastructure Enablement", "Infrastructure enablement"],
+    ["Other / Not sure", OTHER_PRODUCT],
+  ]) assert.equal(canonicalProduct(legacy), label, legacy);
+  // ...and with the real option list they land on the canonical value.
+  const q = mapLeadQualification({ products: "Managed EDR, IP Phones" }, OPTIONS);
+  assert.equal(q.fields.cr57d_productsofinterest, [pv("Cloud calling / Hosted PBX"), pv("Managed cybersecurity")].join(","));
+});
+
+test("appendBlock: an oversized block keeps its head", () => {
+  const block = "--- stamp · Iris ---\nAsked for: SIP trunking\n" + "x".repeat(5000);
+  const out = appendBlock("older history", block);
+  assert.ok(out.length <= 4000);
+  assert.ok(out.startsWith("--- stamp · Iris ---\nAsked for: SIP trunking"));
+  assert.ok(out.endsWith("[truncated]"));
+  assert.equal(appendBlock("a", "b"), "a\n\nb");
 });
 
 console.log(`\n${passed} passed, ${failed.length} failed`);
