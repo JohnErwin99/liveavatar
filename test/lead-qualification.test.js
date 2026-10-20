@@ -7,6 +7,7 @@ import {
   timelineToTimeframe, timelineFromDetails, optionIndex, parseMultiSelect, unionMultiSelect, mapLeadQualification,
   qualificationPatch, fmtStamp, fmtDate, dedupeLines, stampedBlock, appendBlock, quoteRequestRef,
   quoteBilling, quoteProductLabel, money, buildQuoteRequest, dcValue, fmtDuration, normalizeRecap, buildRecapNote,
+  recapBody, recapFieldsLine, recapBlock, RECAP_BLOCK_MAX, hasBlock,
 } from "../lib/lead-qualification.js";
 
 let passed = 0;
@@ -230,7 +231,7 @@ test("stampedBlock: date, source, what they asked for, deduped answers", () => {
   assert.doesNotMatch(block, /conv_|New conversation/);
 });
 
-test("appendBlock appends after a blank line and keeps the newest 4000 chars", () => {
+test("appendBlock appends after a blank line and stays within 4000 chars", () => {
   assert.equal(appendBlock("", "B"), "B");
   assert.equal(appendBlock(null, "B"), "B");
   assert.equal(appendBlock("A", "B"), "A\n\nB");
@@ -434,6 +435,98 @@ test("appendBlock: an oversized block keeps its head", () => {
   assert.ok(out.startsWith("--- stamp · Iris ---\nAsked for: SIP trunking"));
   assert.ok(out.endsWith("[truncated]"));
   assert.equal(appendBlock("a", "b"), "a\n\nb");
+});
+
+// ---- Iris recap in Form Answers ----
+
+test("recap block: ET header at call end with duration, fields line, bullets, no blank lines or ids", () => {
+  const block = recapBlock({
+    at: new Date("2026-10-19T14:05:00Z"), durationSecs: 200,
+    country: "Canada", segment: "enterprise", products: "SIP Trunking, fax to email",
+    recap: "Needs:\n• SIP trunks for 40 users\n\n• 3CX PBX, 20 channels\nNext step:\n• Quote by Friday",
+  });
+  assert.equal(block, [
+    "--- 2026-10-19 10:05 ET · Iris recap (3 min 20 s) ---",
+    "Country: Canada · Segment: Enterprise · Products: SIP trunking, Not sure / other (fax to email)",
+    "Needs:",
+    "- SIP trunks for 40 users",
+    "- 3CX PBX, 20 channels",
+    "Next step:",
+    "- Quote by Friday",
+  ].join("\n"));
+  assert.doesNotMatch(block, /\n\n|conv_|Conversation:/);
+});
+
+test("recap block: optional parts omitted; a bullet repeated under two headings is kept", () => {
+  const block = recapBlock({ at: new Date("2026-10-19T14:05:00Z"), recap: "A:\n- same\nB:\n- same", segment: "unknown" });
+  assert.equal(block, "--- 2026-10-19 10:05 ET · Iris recap ---\nA:\n- same\nB:\n- same");
+});
+
+test("recap block is null exactly when the recap note is", () => {
+  for (const recap of ["", "   ", undefined, null, "No sales conversation", "No sales conversation.",
+    "no sales activity", "Asked about 911 address.", "No sales conversation yet, asked about pricing."]) {
+    assert.equal(recapBlock({ recap, country: "Canada" }) === null, buildRecapNote({ recap, country: "Canada" }) === null, String(recap));
+  }
+  assert.equal(recapBody("No sales conversation."), "");
+  assert.equal(recapFieldsLine({ segment: "wholesale" }), "Segment: Wholesale");
+  assert.equal(recapFieldsLine({}), "");
+});
+
+test("recap block: capped at whole lines, header kept, history survives the append", () => {
+  const recap = Array.from({ length: 300 }, (_, i) => `- point number ${i} about the customer's needs`).join("\n");
+  const block = recapBlock({ at: new Date("2026-10-19T14:05:00Z"), durationSecs: 61, recap });
+  assert.ok(block.length <= RECAP_BLOCK_MAX, String(block.length));
+  assert.ok(block.startsWith("--- 2026-10-19 10:05 ET · Iris recap (1 min 1 s) ---\n- point number 0 "));
+  assert.ok(block.endsWith("\n[truncated]"));
+  assert.match(block.split("\n").slice(-2)[0], /^- point number \d+ about the customer's needs$/);
+  // History + recap over 4000: the older block keeps its head, not wiped.
+  const out = appendBlock("--- old · Website contact form ---\nAsked for: SIP trunking\n" + "h".repeat(2600), block);
+  assert.ok(out.length <= 4000, String(out.length));
+  assert.ok(out.endsWith("\n[truncated]\n\n" + block));
+  assert.ok(out.startsWith("--- old · Website contact form ---\nAsked for: SIP trunking\nhhh"));
+  // One huge recap line is cut, not dropped.
+  const one = recapBlock({ recap: "x".repeat(5000) });
+  assert.ok(one.length <= RECAP_BLOCK_MAX && /\nx{40,}\n\[truncated\]$/.test(one));
+});
+
+test("hasBlock matches a block's header line exactly", () => {
+  const block = "--- 2026-10-19 10:05 ET · Iris recap (3 min 20 s) ---\n- a";
+  assert.equal(hasBlock("--- older ---\nx\n\n" + block, block), true);
+  assert.equal(hasBlock("--- 2026-10-19 10:05 ET · Iris recap (3 min 21 s) ---\n- a", block), false);
+  assert.equal(hasBlock("", block), false);
+  assert.equal(hasBlock(null, block), false);
+  assert.equal(hasBlock("x", ""), false);
+});
+
+test("appendBlock trims oldest history by whole blocks; a partly-fitting block keeps its head", () => {
+  const blk = (n) => `--- 2026-10-1${n} 09:00 ET · Website contact form ---\n` + String(n).repeat(1795);
+  // 1 + 2 + 3 > 4000: 2 and 3 whole, 1 keeps its head (304 chars of room).
+  const out = appendBlock([blk(1), blk(2)].join("\n\n"), blk(3));
+  assert.ok(out.length <= 4000);
+  assert.ok(out.startsWith("--- 2026-10-11 09:00 ET"), out.slice(0, 40));
+  assert.ok(out.includes("\n[truncated]\n\n" + blk(2) + "\n\n" + blk(3)));
+  // Too little room left (< 200) for the oldest: it's dropped, not shown as a stub.
+  const a = "--- A ---\n" + "a".repeat(100), b = "--- B ---\n" + "b".repeat(3000);
+  const c = "--- C ---\n" + "c".repeat(4000 - b.length - 2 - 10); // b + "\n\n" + c is exactly 4000
+  assert.equal(appendBlock(a + "\n\n" + b, c), b + "\n\n" + c);
+  // Older block fits whole once the one before it is dropped (no off-by-one).
+  const b2 = "--- B ---\n" + "b".repeat(2000);
+  for (const extra of [0, 1, 2, 3]) {
+    const c2 = "--- C ---\n" + "c".repeat(4000 - b2.length - 2 - 10 - extra);
+    assert.equal(appendBlock(a + "\n\n" + b2, c2), b2 + "\n\n" + c2, `extra ${extra}`);
+  }
+  // Reviewer scenario: one big website block + a long recap -> the block's head survives.
+  const form = stampedBlock({ source: "website-form", at: new Date("2026-10-19T14:02:00Z"), topic: "SIP trunking",
+    lines: ["Country: Canada", "Company size: 51-200", "Message: " + "m".repeat(2500)] });
+  const recapB = recapBlock({ at: new Date("2026-10-19T15:00:00Z"), recap: Array.from({ length: 40 }, (_, i) => `- point ${i} ` + "r".repeat(25)).join("\n") });
+  const mixed = appendBlock(form, recapB);
+  assert.ok(mixed.length <= 4000);
+  assert.ok(mixed.includes("Asked for: SIP trunking") && mixed.includes("Company size: 51-200"));
+  assert.ok(mixed.endsWith(recapB));
+  // Legacy history with no block headers: its head is kept, marked.
+  const legacy = appendBlock("legacy details " + "x".repeat(5000), "NEW");
+  assert.equal(legacy.length, 4000);
+  assert.ok(legacy.startsWith("legacy details ") && legacy.endsWith("\n[truncated]\n\nNEW"));
 });
 
 console.log(`\n${passed} passed, ${failed.length} failed`);

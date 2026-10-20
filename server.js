@@ -4,8 +4,8 @@ import crypto from "crypto";
 import { readFileSync as fsReadFileSync } from "fs";
 import {
   mapLeadQualification, qualificationPatch, normalizeSegment, splitList, canonicalProduct, optionIndex,
-  stampedBlock, appendBlock, dedupeLines, quoteRequestRef, buildQuoteRequest, dcValue, buildRecapNote,
-  timelineFromDetails,
+  stampedBlock, appendBlock, hasBlock, dedupeLines, quoteRequestRef, buildQuoteRequest, dcValue, buildRecapNote,
+  recapBlock, timelineFromDetails,
 } from "./lib/lead-qualification.js";
 
 const app = express();
@@ -406,7 +406,8 @@ async function createOrFindLead({ first_name, last_name, email, company, topic, 
     }
     // Append a readable stamped block for this submission: when, where from,
     // what they asked for, the answers. The conversation id is not traced here
-    // — it lives in cr57d_conversationid.
+    // — it lives in cr57d_conversationid. (After an Iris call the post-call
+    // webhook adds an "Iris recap" block the same way.)
     const blockLines = [...answerLines, ...history];
     if (blockLines.length || (topic && topic !== existing.cr57d_topicofinterest)) {
       patch.cr57d_formanswers = appendBlock(existing.cr57d_formanswers, stampedBlock({ source, topic, lines: blockLines }));
@@ -1745,7 +1746,39 @@ app.post("/nda/status", async (req, res) => {
 // ELEVENLABS_WEBHOOK_SECRET.
 // The note comes from the agent's data collection (country, customer_segment,
 // products_of_interest, sales_recap), not the generic transcript_summary,
-// which carries widget/system noise.
+// which carries widget/system noise. On a lead, the same recap is also
+// appended to Form Answers: the lead's AI summary reads columns, not notes.
+
+// Append the recap block to the lead's Form Answers once. Re-reads the column
+// and writes with its ETag, so a retried or concurrent delivery can't append
+// the same block twice (the header line is the duplicate check). Never throws.
+async function appendRecapToFormAnswers(leadId, block, convId) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const cur = await d365("GET", `/leads(${leadId})?$select=cr57d_formanswers`);
+    if (!cur.ok) {
+      console.error("[iris-crm] webhook: form answers read failed:", cur.status, cur.text.slice(0, 300));
+      return;
+    }
+    const prev = cur.json.cr57d_formanswers || "";
+    if (hasBlock(prev, block)) {
+      console.log("[iris-crm] webhook: recap already in form answers for", convId);
+      return;
+    }
+    const etag = cur.json["@odata.etag"];
+    const up = await d365("PATCH", `/leads(${leadId})`, { cr57d_formanswers: appendBlock(prev, block) },
+      { "If-Match": etag || "*" });
+    if (up.ok) {
+      console.log("[iris-crm] webhook: recap added to form answers:", leadId, "conv", convId);
+      return;
+    }
+    if (up.status !== 412) {
+      console.error("[iris-crm] webhook: form answers update failed:", up.status, up.text.slice(0, 300));
+      return;
+    }
+    // 412: the lead changed since the read — read it again and retry once.
+  }
+  console.error("[iris-crm] webhook: form answers update conflicted twice for", leadId, "conv", convId);
+}
 
 function verifyElevenLabsSignature(req) {
   if (!EL_WEBHOOK_SECRET) return false;
@@ -1785,12 +1818,19 @@ app.post("/webhooks/elevenlabs", async (req, res) => {
     const segment = dcValue(dc, "customer_segment");
     const products = dcValue(dc, "products_of_interest");
     const startSecs = Number(data.metadata?.start_time_unix_secs);
+    const durationSecs = data.metadata?.call_duration_secs;
+    const recap = dcValue(dc, "sales_recap");
     // "Iris recap — <date> (<duration>)", a fields line, the recap. Null when
     // sales_recap is empty.
     const note = buildRecapNote({
       at: startSecs ? new Date(startSecs * 1000) : new Date(),
-      durationSecs: data.metadata?.call_duration_secs,
-      country, segment, products, recap: dcValue(dc, "sales_recap"), conversationId: convId,
+      durationSecs, country, segment, products, recap, conversationId: convId,
+    });
+    // The Form Answers copy is stamped at the call's END, so it sorts after the
+    // blocks Iris wrote during the call. Null exactly when the note is.
+    const block = recapBlock({
+      at: startSecs ? new Date((startSecs + (Number(durationSecs) || 0)) * 1000) : new Date(),
+      durationSecs, country, segment, products, recap,
     });
     if (!note && !country && !normalizeSegment(segment) && !products) {
       console.log("[iris-crm] webhook: no recap or fields for conversation", convId, "— skipping");
@@ -1841,24 +1881,25 @@ app.post("/webhooks/elevenlabs", async (req, res) => {
     }
 
     // Idempotency: retried webhook deliveries must not duplicate the note
-    // (legacy "Iris conversation <id>" summaries count too).
+    // (legacy "Iris conversation <id>" summaries count too). A retry still goes
+    // on to the Form Answers append, which has its own duplicate check, so it
+    // can repair an append that failed the first time.
     const dup = await d365("GET", `/annotations?$select=annotationid&$filter=_objectid_value eq ${target.id} and ` +
       `(subject eq 'Iris conversation ${safeConv}' or (startswith(subject,'Iris recap') and contains(notetext,'Conversation: ${likeConv}')))&$top=1`);
     if (dup.ok && dup.json.value.length) {
       console.log("[iris-crm] webhook: note already attached for", convId);
-      return;
+    } else {
+      const created = await d365("POST", "/annotations", {
+        subject: note.subject,
+        notetext: note.notetext,
+        [`objectid_${target.entity}@odata.bind`]: `/${target.entity}s(${target.id})`,
+      });
+      if (!created.ok) console.error("[iris-crm] webhook: note create failed:", created.status, created.text.slice(0, 300));
+      else console.log("[iris-crm] webhook: recap attached to", target.entity, target.id, "conv", convId);
     }
 
-    const created = await d365("POST", "/annotations", {
-      subject: note.subject,
-      notetext: note.notetext,
-      [`objectid_${target.entity}@odata.bind`]: `/${target.entity}s(${target.id})`,
-    });
-    if (!created.ok) {
-      console.error("[iris-crm] webhook: note create failed:", created.status, created.text.slice(0, 300));
-      return;
-    }
-    console.log("[iris-crm] webhook: recap attached to", target.entity, target.id, "conv", convId);
+    // Customers' contacts have no Form Answers; leads get the recap there too.
+    if (target.entity === "lead" && block) await appendRecapToFormAnswers(target.id, block, convId);
   } catch (e) {
     console.error("[iris-crm] webhook processing failed:", e.message);
   }
