@@ -7,6 +7,7 @@ import {
   stampedBlock, appendBlock, hasBlock, dedupeLines, quoteRequestRef, buildQuoteRequest, dcValue, buildRecapNote,
   recapBlock, timelineFromDetails,
 } from "./lib/lead-qualification.js";
+import { createDidRouter } from "./lib/did-routes.js";
 
 const app = express();
 app.use(express.json({
@@ -1904,6 +1905,11 @@ app.post("/webhooks/elevenlabs", async (req, res) => {
     console.error("[iris-crm] webhook processing failed:", e.message);
   }
 });
+
+// ---- Self-serve "Buy phone numbers" (iristel.com /phone-numbers/*) ----
+// Espresso inventory + holds, IristelX payment, MIND billing; see lib/did-routes.js.
+// Off until DID_ORDERING_ENABLED=true. Paid orders also land in D365 as leads.
+app.use("/did", createDidRouter({ crmLead: (args) => createOrFindLead(args) }));
 
 const PORT = process.env.PORT || 3000;   // Railway injects PORT automatically
 app.listen(PORT, () => console.log("LiveAvatar token server listening on", PORT));
