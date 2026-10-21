@@ -595,6 +595,10 @@
       token: st.token || null, sel: st.sel || [], search: st.search || { province: "ON", type: "all", match: "contains" }, results: null };
     try { S.urls = JSON.parse(mount.getAttribute("data-urls") || "null"); } catch (e) {}
     if (qs("t")) { S.token = qs("t"); save(); }
+    // Steps after the search are per-visitor pages: keep them out of search results
+    if (S.step !== "find" && !document.querySelector('meta[name="robots"][content*="noindex"]')) {
+      document.head.appendChild(el("meta", { name: "robots", content: "noindex, nofollow" }));
+    }
     mount.textContent = "";
     mount.appendChild(el("div", { class: "iri-ord-wrap" }, el("p", { class: "iri-ord-empty", text: "Loading…" })));
     Promise.all([api("/config"), api("/catalog")]).then(function (r) {
