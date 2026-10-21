@@ -120,7 +120,7 @@
     mount.textContent = "";
     var top = el("div", { class: "iri-ord-wrap" },
       step !== "order" ? stepper(step) : null,
-      cfg && cfg.prices && !cfg.prices.approved ? el("p", { style: "margin:-8px 0 18px" }, el("span", { class: "iri-ord-chip", text: "Example pricing in CAD · confirmed before you pay" })) : null,
+      step !== "order" && cfg && cfg.prices && !cfg.prices.approved ? el("p", { style: "margin:-8px 0 18px" }, el("span", { class: "iri-ord-chip", text: "Example pricing in CAD · confirmed before you pay" })) : null,
       el("div", { class: "iri-ord-layout" + (opts.bar ? " has-bar" : "") + (step === "review" ? " is-review" : "") },
         el("div", { class: "iri-ord-main" }, main), summary ? el("aside", { class: "iri-ord-summary", "aria-label": "Order summary" }, summary) : null));
     add(mount, [top, opts.bar || null, el("div", { id: "iri-ord-live", class: "sr", "aria-live": "polite" })]);
@@ -421,7 +421,7 @@
     }
     function draw() {
       form.textContent = "";
-      add(form, [el("h2", { text: "Choose where calls will go" }),
+      add(form, [el("h2", { text: "Destination and connection" }),
         el("p", { class: "iri-ord-help", style: "margin:4px 0 16px", text: "Your numbers arrive on Iristel's network. Tell us where to send the calls; our provisioning team uses these details to connect them." }),
         el("div", { class: "lbl", style: "margin-bottom:8px", text: "Destination" }),
         choiceGroup("Destination", [["pbx", "My own PBX or calling platform", "Delivered over an Iristel SIP connection. No Iristel hosted PBX needed."],

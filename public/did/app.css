@@ -70,6 +70,7 @@
 .iri-ord-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:48px;padding:12px 24px;border:0;
   border-radius:999px;background:var(--cta);color:#fff;font:500 16px/1.2 Ubuntu,Arial,sans-serif;cursor:pointer;text-decoration:none}
 .iri-ord-btn:hover{background:var(--cta2)}
+.iri-ord a.iri-ord-btn{color:#fff}.iri-ord a.iri-ord-btn.is-secondary{color:var(--navy)}
 .iri-ord-btn.is-secondary{background:#fff;color:var(--navy);border:1px solid var(--line2)}
 .iri-ord-btn.is-secondary:hover{border-color:var(--navy)}
 .iri-ord-btn.is-small{min-height:36px;padding:7px 16px;font-size:14px}
@@ -164,6 +165,8 @@
 @media (max-width:767px){
   .iri-ord{padding-bottom:110px}
   .iri-ord-steps li:not(.is-current) .t{display:none}
+  .iri-ord-steps li.is-current{flex:3}
+  .iri-ord-steps .is-current .t{overflow:visible;text-overflow:clip}
   .iri-ord-card{padding:18px}
   .iri-ord-hold{margin:-18px -18px 16px}
   .iri-ord-grid,.iri-ord-grid.is-2,.iri-ord-grid.is-3{grid-template-columns:1fr}
