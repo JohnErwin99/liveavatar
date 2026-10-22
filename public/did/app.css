@@ -133,6 +133,7 @@
 .iri-ord-callout.is-success{background:var(--ok-bg);color:#0a5c45;border-color:#bfe3d3}
 .iri-ord-callout.is-warning{background:var(--warn-bg);color:#6e4100;border-color:#f1d9a8}
 .iri-ord-callout.is-error{background:var(--err-bg);color:#8a1c13;border-color:#f3c6c2}
+.iri-ord-callout.is-demo{background:#fdf2f6;color:#6d0b30;border:1.5px solid var(--cta)}
 .iri-ord-callout strong{display:block}
 
 /* Charges and status */

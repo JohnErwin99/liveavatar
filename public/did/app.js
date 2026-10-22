@@ -40,7 +40,7 @@
   }
   function money(v) { return "$" + Number(v || 0).toFixed(2); }
   function load() { try { return JSON.parse(sessionStorage.getItem(KEY)) || {}; } catch (e) { return {}; } }
-  function save() { try { sessionStorage.setItem(KEY, JSON.stringify({ token: S.token, sel: S.sel, search: S.search })); } catch (e) {} }
+  function save() { try { sessionStorage.setItem(KEY, JSON.stringify({ token: S.token, sel: S.sel, search: S.search, demo: S.demo || undefined })); } catch (e) {} }
   function qs(name) { var m = new RegExp("[?&]" + name + "=([^&]*)").exec(location.search); return m ? decodeURIComponent(m[1].replace(/\+/g, " ")) : ""; }
   function url(step) {
     var custom = S.urls && S.urls[step];
@@ -119,11 +119,18 @@
     opts = opts || {};
     mount.textContent = "";
     var top = el("div", { class: "iri-ord-wrap" },
+      S.demo ? demoBanner() : null,
       step !== "order" ? stepper(step) : null,
       step !== "order" && cfg && cfg.prices && !cfg.prices.approved ? el("p", { style: "margin:-8px 0 18px" }, el("span", { class: "iri-ord-chip", text: "Example pricing in CAD · confirmed before you pay" })) : null,
       el("div", { class: "iri-ord-layout" + (opts.bar ? " has-bar" : "") + (step === "review" ? " is-review" : "") },
         el("div", { class: "iri-ord-main" }, main), summary ? el("aside", { class: "iri-ord-summary", "aria-label": "Order summary" }, summary) : null));
     add(mount, [top, opts.bar || null, el("div", { id: "iri-ord-live", class: "sr", "aria-live": "polite" })]);
+  }
+
+  function demoBanner() {
+    var b = callout("demo", "Demo mode.", " Sample numbers, no real order and no charge. Nothing you enter is sent to our billing or ordering systems.");
+    b.setAttribute("role", "status");
+    return b;
   }
 
   // Summary card: the tray before the hold, the held order after it
@@ -260,7 +267,7 @@
       showErrors(form, {});
       results.setAttribute("aria-busy", "true");
       if (!page) { results.textContent = ""; results.appendChild(el("p", { class: "iri-ord-empty", text: "Searching…" })); }
-      api("/search", { body: { province: s.province, ratecenter: s.ratecenter, areaCode: s.areaCode, digits: s.digits, word: s.word, match: s.match, type: s.type || "all", page: page } })
+      api("/search", { body: { province: s.province, ratecenter: s.ratecenter, areaCode: s.areaCode, digits: s.digits, word: s.word, match: s.match, type: s.type || "all", page: page, demo: S.demo || undefined } })
         .then(function (j) { S.results = page ? S.results.concat(j.results) : j.results; S.more = j.more; S.page = page; S.lastMatch = j.match; drawResults(results); say(S.results.length + " numbers found."); })
         .catch(function (e) { results.textContent = ""; if (e.data && e.data.errors) showErrors(form, e.data.errors); results.appendChild(callout(e.code === "INVENTORY_UNAVAILABLE" ? "warning" : "error", e.code === "INVENTORY_UNAVAILABLE" ? "Number search is temporarily unavailable." : "", e.message)); })
         .then(function () { results.setAttribute("aria-busy", "false"); });
@@ -322,7 +329,7 @@
   function hold(nums, btn) {
     if (!nums.length) return;
     busy(btn, true, "Reserving your numbers…");
-    api("/hold", { body: { numbers: nums.map(function (n) { return { did: n.did, rc: n.rc || null }; }), token: S.token || undefined } })
+    api("/hold", { body: { numbers: nums.map(function (n) { return { did: n.did, rc: n.rc || null }; }), token: S.token || undefined, demo: S.demo || undefined } })
       .then(function (j) {
         S.token = j.token; S.order = j.order; save();
         return waitHeld(30);
@@ -491,9 +498,16 @@
         el("p", { text: "Inbound calls to your numbers are included. Forwarding and outbound minutes are billed separately if used." }))));
 
     var cvv = input("cvv", "", { inputmode: "numeric", autocomplete: "cc-csc", maxlength: "4" });
+    var testCard = S.demo ? callout("demo", "Demo: use a test card.", " 4242 4242 4242 4242 is approved and 4000 0000 0000 0002 is declined. Any future expiry and any 3-digit code. Nothing is charged.",
+      el("div", { class: "iri-ord-actions", style: "margin-top:10px" }, el("button", { type: "button", class: "iri-ord-btn is-secondary is-small", text: "Use test card", onclick: function () {
+        var set = function (n, v) { var i = form.querySelector('[name="' + n + '"]'); if (i) i.value = v; };
+        set("holder", [d.firstName, d.lastName].join(" ").trim() || "Demo Customer"); set("number", "4242 4242 4242 4242");
+        set("expMonth", "12"); set("expYear", String(new Date().getFullYear() + 1)); set("cvv", "123");
+      } }))) : null;
     var form = el("form", { class: "iri-ord-card", novalidate: true },
       el("h2", { text: "Payment" }),
-      el("p", { class: "iri-ord-help", style: "margin:4px 0 16px", text: "Your card is processed by Iristel's payment provider. We don't store your card number or security code." }),
+      el("p", { class: "iri-ord-help", style: "margin:4px 0 16px", text: S.demo ? "Demo mode: no card is charged. Card details aren't stored or sent to a payment provider." : "Your card is processed by Iristel's payment provider. We don't store your card number or security code." }),
+      testCard,
       el("div", { class: "iri-ord-grid is-2" },
         field("Name on card", input("holder", "", { autocomplete: "cc-name" }), { name: "holder", cls: "is-full" }),
         field("Card number", input("number", "", { inputmode: "numeric", autocomplete: "cc-number", maxlength: "23" }), { name: "number", cls: "is-full" }),
@@ -506,7 +520,7 @@
         el("label", { class: "iri-ord-check" }, el("input", { type: "checkbox", name: "recurring" }),
           el("span", { text: "I authorize Iristel to charge this card " + money(q.monthly) + " + tax every month until I cancel." })),
         el("div", { class: "iri-ord-error" })),
-      el("div", { class: "iri-ord-actions" }, el("button", { type: "submit", class: "iri-ord-btn", text: "Pay " + money(q.dueToday) + " and activate" }),
+      el("div", { class: "iri-ord-actions" }, el("button", { type: "submit", class: "iri-ord-btn", text: S.demo ? "Place demo order (no charge)" : "Pay " + money(q.dueToday) + " and activate" }),
         el("span", { class: "iri-ord-help", text: q.approved ? "" : "Example pricing for testing. You will see the final price before paying." })));
     form.addEventListener("submit", function (e) {
       e.preventDefault();
@@ -514,7 +528,7 @@
       var body = { amount: q.dueToday, quoteVersion: q.version, consents: { terms: f("terms"), recurring: f("recurring") },
         card: { holder: f("holder"), number: f("number"), expMonth: f("expMonth"), expYear: f("expYear"), cvv: f("cvv") } };
       if (!body.consents.terms || !body.consents.recurring) return showErrors(form, { consents: "Accept both to place the order." });
-      busy(btn, true, "Processing payment…");
+      busy(btn, true, S.demo ? "Placing demo order…" : "Processing payment…");
       api("/pay", { body: body })
         .then(function (j) { S.order = j.order; save(); go("order", "?ref=" + encodeURIComponent(j.order.ref) + "&t=" + encodeURIComponent(S.token)); })
         .catch(function (err) {
@@ -540,7 +554,8 @@
   function orderStep() {
     var o = S.order;
     var active = o.state === "active";
-    var head = active ? callout("success", o.numbers.length > 1 ? "Your numbers are active." : "Your number is active.", " Order " + o.ref + ". A receipt is on its way to " + (o.details && o.details.email) + ".")
+    var head = active && o.demo ? callout("success", "Demo order complete.", " Order " + o.ref + ". No numbers were assigned, no payment was taken and no email was sent.")
+      : active ? callout("success", o.numbers.length > 1 ? "Your numbers are active." : "Your number is active.", " Order " + o.ref + ". A receipt is on its way to " + (o.details && o.details.email) + ".")
       : o.state === "delayed" ? callout("warning", "Your order is processing.", " " + (o.message || "We'll email you as soon as your numbers are active. There's no need to pay again."))
       : o.state === "payment_unknown" ? callout("warning", "We are checking your payment.", " Do not pay again. Reference " + (o.payment && o.payment.reference || "") + ".")
       : ["completing", "paying"].indexOf(o.state) >= 0 ? callout("", "Activating your numbers…", " This usually takes under a minute. You can close this page; we'll email you.")
@@ -555,7 +570,7 @@
     var p = o.payment || {}, q = o.quote || {};
     var receipt = el("div", { class: "iri-ord-card" }, el("h3", { text: "Receipt" }), el("div", { class: "iri-ord-lines", style: "border-top:0" },
       el("span", { text: "Order" }), el("span", { text: o.ref }),
-      el("span", { text: "Paid" }), el("span", { text: p.outcome === "success" ? money(p.amount) + " CAD" : "—" }),
+      el("span", { text: o.demo ? "Total (demo)" : "Paid" }), el("span", { text: p.outcome === "success" ? money(p.amount) + " CAD" + (o.demo ? ", not charged" : "") : "—" }),
       el("span", { text: "Card" }), el("span", { text: p.masked || "—" }),
       el("span", { text: "Payment reference" }), el("span", { text: p.reference || "—" }),
       el("span", { text: "Next bill" }), el("span", { text: o.nextBill ? o.nextBill + " · " + money(q.monthly) + " + tax" : "—" })),
@@ -603,12 +618,16 @@
     mount.appendChild(el("div", { class: "iri-ord-wrap" }, el("p", { class: "iri-ord-empty", text: "Loading…" })));
     Promise.all([api("/config"), api("/catalog")]).then(function (r) {
       cfg = r[0]; cat = r[1];
-      if (!cfg.enabled && S.step !== "order") {
+      // Demo: automatic while live ordering is off, or asked for with ?demo=1 (?demo=0 leaves it)
+      if (qs("demo") === "0") S.demo = false;
+      else S.demo = !!cfg.demo && (!cfg.enabled || qs("demo") === "1" || !!st.demo);
+      save();
+      if (!cfg.enabled && !S.demo && S.step !== "order") {
         frame(S.step, callout("warning", "Online ordering is temporarily unavailable.", " Call 1 833 IRISTEL (474 7835) and our team will set up your numbers."));
         return;
       }
       if (S.step === "find" || !S.token) return route();
-      return api(S.step === "order" ? "/order" : "/basket").then(function (j) { S.order = j.order; route(); },
+      return api(S.step === "order" ? "/order" : "/basket").then(function (j) { S.order = j.order; if (j.order && j.order.demo) S.demo = true; route(); },
         function (e) { if (S.step === "order") { S.order = null; return route(); } S.token = null; save(); go("find"); });
     }).catch(function (e) { frame(S.step, callout("error", "We couldn't load the order form.", " " + e.message)); });
   }
