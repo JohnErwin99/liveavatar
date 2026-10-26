@@ -297,6 +297,10 @@ body.iri-ord-compact .iri-ord-hero .iri-ord-h1{font-size:28px;margin:0}
 .iri-ord-card-iris .note{display:flex;gap:6px;font-size:12.5px;color:var(--muted);margin-top:10px}
 .iri-ord-card-iris .note .iri-ic{width:14px;height:14px;margin-top:2px}
 .iri-ord-sheet{display:none}
+/* Iris widget on these pages (html.iri-ord-iris, set by app.js): no "Turn on Iris" pill (Ask Iris turns her on),
+   and on phones the dock sits above the bottom price bar */
+html.iri-ord-iris #iris-reenable{display:none!important}
+@media (max-width:767px){html.iri-ord-iris.iri-ord-bar #iris-dock{bottom:calc(var(--iri-ord-mbar-h) + 14px)!important}}
 .iri-ord-ho{width:100%;min-height:110px;margin-top:10px;padding:10px;border:1px solid var(--line2);border-radius:var(--r-sm);font:inherit;font-size:14px;background:var(--bg)}
 
 /* ---------- callouts ---------- */

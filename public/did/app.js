@@ -402,18 +402,29 @@
     mount.setAttribute("lang", S.lang);
     heroLang();
     var rail = opts.rail === false ? null : irisRail(step);
+    var irisOn = S.irisNote ? callout("success", "", t("iris.onTap"),
+      el("div", { class: "iri-ord-actions is-tight" }, el("button", { type: "button", class: "iri-ord-btn is-iris is-small", "data-iris-on": "1", onclick: openIris }, ic("sparkle"), t("iris.ask"))), "sparkle") : null;
     var body = el("div", { class: "iri-ord-wrap" },
       S.demo ? demoBanner() : null,
       el("div", { class: "iri-ord-layout" + (rail ? " has-rail" : "") + (opts.bar ? " has-bar" : "") + (opts.cls ? " " + opts.cls : "") },
-        el("div", { class: "iri-ord-main" }, main), rail));
+        el("div", { class: "iri-ord-main" }, irisOn, main), rail));
     add(mount, [opts.bare ? null : stepBar(step), body, opts.bar || null, irisSheet(), el("div", { id: "iri-ord-live", class: "sr", "aria-live": "polite" })]);
     if (step !== "find") document.title = t("title." + (step === "connect" && S.sub === "e911" ? "e911" : step)) + " · Iristel";
-    if (opts.focus) {
+    var onBtn = S.irisNote && !S.irisNoteShown && mount.querySelector("[data-iris-on]");
+    if (onBtn) { S.irisNoteShown = true; onBtn.scrollIntoView({ block: "center" }); onBtn.focus({ preventScroll: true }); }
+    else if (opts.focus) {
       var h = mount.querySelector(".iri-ord-main h1, .iri-ord-main h2");
       if (h) { h.setAttribute("tabindex", "-1"); try { h.focus({ preventScroll: true }); } catch (e) { h.focus(); } }
     } else refocus(keep);
+    barSpace();
     startClock();
     emitContext();
+  }
+  // The site's Iris dock sits above the phone bottom bar (app.css); the bar's height varies with wrapping and safe areas
+  function barSpace() {
+    var bar = mount && mount.querySelector(".iri-ord-mbar"), h = bar ? bar.offsetHeight : 0, root = document.documentElement;
+    root.style.setProperty("--iri-ord-mbar-h", h + "px");
+    root.classList.toggle("iri-ord-bar", h > 0);
   }
   function head(title, lede, extra) {
     return el("div", { class: "iri-ord-head" }, el("h1", null, title, extra || null), lede ? el("p", { class: "lede", text: lede }) : null);
@@ -491,12 +502,21 @@
     try { if (localStorage.getItem("iris_disabled") === "1") return true; } catch (e) {}
     return /(^|;)\s*iris_disabled=1/.test(document.cookie);
   }
-  function openIris() {
+  function openIris(e) {
+    // Switched off on this device: turn her on the way the site's "Turn on Iris" pill does (reloads the page;
+    // the basket and filters are in sessionStorage). After the reload a notice asks for one more tap.
+    if (irisOff() && window.IrisOptOut && IrisOptOut.enable) {
+      try { sessionStorage.setItem("iriOrdIrisOn", "1"); } catch (x) {}
+      if (e && e.currentTarget) busy(e.currentTarget, true, t("iris.turningOn"));
+      say(t("iris.turningOn"));
+      IrisOptOut.enable();
+      return;
+    }
     var dock = document.getElementById("iris-dock");
     if (!dock || irisOff()) { if (!S.irisDown) { S.irisDown = true; refreshRail(); } return; }
     dock.classList.add("iris-in"); // visible even if it was closed on this page, so a call never runs hidden
-    try { window.dispatchEvent(new Event("iris:audio-unlocked")); } catch (e) {}
-    if (S.irisDown) { S.irisDown = false; refreshRail(); }
+    try { window.dispatchEvent(new Event("iris:audio-unlocked")); } catch (x) {}
+    if (S.irisDown || S.irisNote) { S.irisDown = false; S.irisNote = false; rerender(); }
   }
   function refreshRail() {
     var old = mount && mount.querySelector(".iri-ord-rail");
@@ -1748,6 +1768,12 @@
     if (S.step === "connect" && S.sub === "e911" && !o.connect) { S.sub = null; }
     return ({ account: accountStep, connect: connectStep, review: function () { reviewStep(); } })[S.step]();
   }
+  // Back from turning Iris on (a page reload): show the same search results again, not the landing.
+  // Results aren't saved, only the search and its filters, so the search runs again once the step is up.
+  function land() {
+    route();
+    if (S.irisNote && S.render === findStep && S.search.q && S.search.filters) runSearch(0);
+  }
   function unavailable() {
     S.render = unavailable;
     frame(S.step, callout("warning", t("off.t"), t("off.d")), { rail: false, bare: true }); // no steps: nothing can be ordered
@@ -1755,7 +1781,13 @@
 
   function init() {
     mount = document.getElementById("iri-ord");
+    // html.iri-ord-iris scopes the Iris tweaks in app.css to these pages (removed after a swup visit elsewhere)
+    document.documentElement.classList.toggle("iri-ord-iris", !!mount);
     if (!mount || mount.getAttribute("data-ready")) return;
+    // Iris starts only from "Ask Iris (AI)" here: the widget's own once-per-visit flag turns its auto-start off
+    try { sessionStorage.setItem("iris_greeted", "1"); } catch (e) {}
+    var irisJustOn = false;
+    try { irisJustOn = sessionStorage.getItem("iriOrdIrisOn") === "1"; sessionStorage.removeItem("iriOrdIrisOn"); } catch (e) {}
     mount.setAttribute("data-ready", "1");
     mount.className = "iri-ord";
     clearInterval(timer); clearTimeout(poller);
@@ -1763,7 +1795,8 @@
     S = { api: (mount.getAttribute("data-api") || "").replace(/\/+$/, ""), step: mount.getAttribute("data-step") || "find",
       base: mount.getAttribute("data-base") || "/phone-numbers/", urls: null, token: st.token || null, sel: st.sel || [],
       search: st.search || { q: "", filters: null, sort: "best" }, results: null, lang: (qs("lang") === "fr" || qs("lang") === "en") ? qs("lang") : st.lang || "en",
-      mode: st.mode || "rent", acct: st.acct || null, ui: st.ui || {}, hideAi: !!st.hideAi, pendingIris: st.pending || null, cards: [], rendered: {} };
+      mode: st.mode || "rent", acct: st.acct || null, ui: st.ui || {}, hideAi: !!st.hideAi, pendingIris: st.pending || null, cards: [], rendered: {},
+      irisNote: irisJustOn && !irisOff() };
     try { S.urls = JSON.parse(mount.getAttribute("data-urls") || "null"); } catch (e) {}
     if (qs("t")) { S.token = qs("t"); save(); }
     // Steps after the search are per-visitor pages: keep them out of search results
@@ -1786,9 +1819,9 @@
       var liveReady = cfg.enabled && cfg.features && cfg.features.e911;
       if (!S.demo && !liveReady && S.step !== "order") return unavailable();
       if (S.pendingIris && S.step === "find") { S.search.ideas = S.pendingIris.words; var pq = S.pendingIris.q; S.pendingIris = null; save(); return runQuery(pq, true); }
-      if (S.step === "find" && !S.token) return route();
+      if (S.step === "find" && !S.token) return land();
       if (!S.token) return route();
-      return api(S.step === "order" ? "/order" : "/basket").then(function (j) { S.order = j.order; if (j.order && j.order.demo) S.demo = true; route(); },
+      return api(S.step === "order" ? "/order" : "/basket").then(function (j) { S.order = j.order; if (j.order && j.order.demo) S.demo = true; land(); },
         function () { if (S.step === "order") { S.order = null; return route(); } if (S.step === "find") { S.token = null; save(); return route(); } S.token = null; save(); go("find"); });
     }).catch(function (e) {
       mount.textContent = "";
@@ -1804,6 +1837,7 @@
   document.addEventListener("iris:propose-search", function (e) { onIrisSearch(e.detail); });
   document.addEventListener("iris:action-card", function (e) { onIrisCard(e.detail); });
   document.addEventListener("swup:page:view", init);
+  window.addEventListener("resize", function () { if (S && mount) barSpace(); });
   window.IriOrder = { init: init, context: function () { return window.IriOrderContext || null; } };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init); else init();
 })();
