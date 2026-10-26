@@ -484,10 +484,19 @@
     else body = el("p", null, t("qa.not." + path));
     return el("div", { class: "iri-ord-msg is-answer" }, body, el("p", { class: "src" }, ic("shield"), t("qa.src", { ref: o.ref })));
   }
+  // Opens the site's own Iris (iris-widget-v3-1, unchanged) the way its "Enable Iris & continue"
+  // button does: the widget listens for iris:audio-unlocked, shows the dock and starts the call.
+  // This runs inside the customer's click, so audio is allowed. Turned off or missing → fallback text.
+  function irisOff() {
+    try { if (localStorage.getItem("iris_disabled") === "1") return true; } catch (e) {}
+    return /(^|;)\s*iris_disabled=1/.test(document.cookie);
+  }
   function openIris() {
-    S.irisAck = false;
-    try { document.dispatchEvent(new CustomEvent("iris:open", { detail: { source: "buy-phone-numbers", step: S.view || S.step, lang: S.lang } })); } catch (e) {}
-    setTimeout(function () { if (!S.irisAck && !S.irisDown) { S.irisDown = true; refreshRail(); } }, 1500);
+    var dock = document.getElementById("iris-dock");
+    if (!dock || irisOff()) { if (!S.irisDown) { S.irisDown = true; refreshRail(); } return; }
+    dock.classList.add("iris-in"); // visible even if it was closed on this page, so a call never runs hidden
+    try { window.dispatchEvent(new Event("iris:audio-unlocked")); } catch (e) {}
+    if (S.irisDown) { S.irisDown = false; refreshRail(); }
   }
   function refreshRail() {
     var old = mount && mount.querySelector(".iri-ord-rail");
@@ -1792,7 +1801,6 @@
 
   document.addEventListener("visibilitychange", function () { if (!document.hidden && S && S.token && ["account", "connect", "review"].indexOf(S.step) >= 0 && S.order && S.order.state === "held") refresh(); });
   window.addEventListener("popstate", function () { if (S && S.step === "connect" && S.order) { S.sub = location.hash === "#e911" ? "e911" : null; S.sub ? e911Step() : connectStep(); } });
-  document.addEventListener("iris:opened", function () { if (S) { S.irisAck = true; if (S.irisDown) { S.irisDown = false; refreshRail(); } } });
   document.addEventListener("iris:propose-search", function (e) { onIrisSearch(e.detail); });
   document.addEventListener("iris:action-card", function (e) { onIrisCard(e.detail); });
   document.addEventListener("swup:page:view", init);
