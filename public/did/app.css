@@ -417,6 +417,22 @@ html.iri-ord-iris #iris-reenable{display:none!important}
 .iri-ord-lines-n li:first-child{border-top:0;padding-top:0}
 .iri-ord-lines-n small{display:block;font-size:12.5px;color:var(--muted);margin-top:2px}
 .iri-ord-lines-n .r{text-align:right;font-size:14px;white-space:nowrap}
+.iri-ord-link.is-rm{display:flex;margin:2px 0 0 auto;min-height:32px;font-size:13.5px}
+.iri-ord-rev-more{margin:2px 0 10px}
+.iri-ord.is-paying [data-rm],.iri-ord.is-paying .iri-ord-rev-more{visibility:hidden}
+.iri-ord-tray-edit{color:#fff;font-size:13px;font-weight:600;vertical-align:2px}
+.iri-ord-tray-edit:hover{color:#d4e7f6}
+/* "Your numbers": a centred dialog on desktop (opened from the tray); on phones a panel above the bottom bar */
+.iri-ord-basket-bg{position:fixed;inset:0;z-index:100000;background:rgba(11,34,57,.5)}
+.iri-ord-basket{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:100001;width:min(520px,calc(100vw - 48px));max-height:80vh;overflow:auto;
+  padding:18px 22px 22px;border-radius:16px;background:#fff;color:var(--text);box-shadow:0 20px 50px rgba(11,34,57,.3)}
+.iri-ord-basket-h{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}
+.iri-ord-basket-h h2{margin:0;font-size:18px;line-height:1.3;color:var(--ink)}
+.iri-ord-basket-h h2:focus{outline:none}
+.iri-ord-basket .iri-ord-callout{margin-bottom:10px}
+.iri-ord-basket .iri-ord-dl{padding:12px 0 4px}
+.iri-ord-basket .iri-ord-help{margin:6px 0 14px}
+.iri-ord-basket .iri-ord-actions>.iri-ord-btn{flex:1 1 auto}
 .iri-ord-dl{display:grid;grid-template-columns:1fr auto;gap:10px 16px;margin:0;padding:14px 0;border-top:1px solid var(--line);font-size:14.5px}
 .iri-ord-dl dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink)}
 .iri-ord-dl .muted{color:var(--muted)}
@@ -550,7 +566,7 @@ html.iri-ord-iris #iris-reenable{display:none!important}
   .iri-ord-radios.is-inline{grid-template-columns:1fr}
   .iri-ord-saved{flex-wrap:wrap}
   .iri-ord-saved .r{width:100%;justify-content:flex-start;padding-left:32px}
-  .iri-ord-layout.has-bar~.iri-ord-sheet,.iri-ord-sheet{display:block;position:fixed;left:8px;right:8px;bottom:84px;z-index:49;max-height:45vh;overflow:auto;
+  .iri-ord-layout.has-bar~.iri-ord-sheet,.iri-ord-sheet{display:block;position:fixed;left:8px;right:8px;bottom:calc(var(--iri-ord-mbar-h,72px) + 12px);z-index:49;max-height:45vh;overflow:auto;
     border-radius:16px 16px 12px 12px;box-shadow:0 -6px 24px rgba(11,34,57,.2)}
   .iri-ord-sheet .iri-ord-card-iris{border:0}
   .iri-ord-mbar{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:50;gap:12px;align-items:center;justify-content:space-between;
@@ -558,6 +574,15 @@ html.iri-ord-iris #iris-reenable{display:none!important}
   .iri-ord-mbar small{display:block;font-size:12.5px;color:#b6c6d6}
   .iri-ord-mbar b{display:block;font-size:18px;font-variant-numeric:tabular-nums}
   .iri-ord-mbar .iri-ord-btn{min-height:46px;padding:10px 20px}
+  .iri-ord-mbar-sum{display:block;min-width:0;margin:-6px -8px;padding:6px 8px;border:0;border-radius:10px;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
+  .iri-ord-mbar-sum:focus-visible{outline:2px solid #fff;outline-offset:1px}
+  .iri-ord-mbar-sum .more{display:inline-flex;align-items:center;gap:4px;margin-top:3px;font-size:13px;font-weight:600;text-decoration:underline;text-underline-offset:2px}
+  .iri-ord-mbar-sum .more .iri-ic{width:14px;height:14px;transform:rotate(-90deg);transition:transform .15s}
+  .iri-ord-mbar.is-open{z-index:100002}
+  .iri-ord-mbar.is-open .iri-ord-mbar-sum .more .iri-ic{transform:rotate(90deg)}
+  .iri-ord-basket{top:auto;left:0;right:0;bottom:var(--iri-ord-mbar-h,0px);transform:none;width:auto;
+    max-height:calc(100vh - var(--iri-ord-mbar-h,0px) - 48px);max-height:calc(100dvh - var(--iri-ord-mbar-h,0px) - 48px);
+    padding:12px 16px 16px;border-radius:16px 16px 0 0;box-shadow:0 -10px 30px rgba(11,34,57,.25)}
 }
 @media (max-width:360px){
   .iri-ord-top-r{width:100%;justify-content:flex-start}

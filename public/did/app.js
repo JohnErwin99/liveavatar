@@ -408,7 +408,9 @@
       S.demo ? demoBanner() : null,
       el("div", { class: "iri-ord-layout" + (rail ? " has-rail" : "") + (opts.bar ? " has-bar" : "") + (opts.cls ? " " + opts.cls : "") },
         el("div", { class: "iri-ord-main" }, irisOn, main), rail));
-    add(mount, [opts.bare ? null : stepBar(step), body, opts.bar || null, irisSheet(), el("div", { id: "iri-ord-live", class: "sr", "aria-live": "polite" })]);
+    if (opts.bar) S.barStep = step; else S.basketOpen = false;
+    add(mount, [opts.bare ? null : stepBar(step), body, opts.bar || null, irisSheet(), el("div", { id: "iri-ord-live", class: "sr", "aria-live": "polite" }),
+      opts.bar && S.basketOpen ? basketSheet(step) : null]);
     if (step !== "find") document.title = t("title." + (step === "connect" && S.sub === "e911" ? "e911" : step)) + " · Iristel";
     var onBtn = S.irisNote && !S.irisNoteShown && mount.querySelector("[data-iris-on]");
     if (onBtn) { S.irisNoteShown = true; onBtn.scrollIntoView({ block: "center" }); onBtn.focus({ preventScroll: true }); }
@@ -425,14 +427,162 @@
     var bar = mount && mount.querySelector(".iri-ord-mbar"), h = bar ? bar.offsetHeight : 0, root = document.documentElement;
     root.style.setProperty("--iri-ord-mbar-h", h + "px");
     root.classList.toggle("iri-ord-bar", h > 0);
+    if (window.ResizeObserver) {
+      barSpace.ro = barSpace.ro || new ResizeObserver(function () { barSpace(); });
+      if (barSpace.ro.el !== bar) { barSpace.ro.disconnect(); barSpace.ro.el = bar; if (bar) barSpace.ro.observe(bar); }
+    }
   }
   function head(title, lede, extra) {
     return el("div", { class: "iri-ord-head" }, el("h1", null, title, extra || null), lede ? el("p", { class: "lede", text: lede }) : null);
   }
   function mobileBar(top, total, label, onclick) {
-    return el("div", { class: "iri-ord-mbar" },
-      el("div", null, el("small", null, top, el("span", { "data-bar-clock": "1" })), el("b", { text: total })),
-      el("button", { type: "button", class: "iri-ord-btn is-light", onclick: onclick }, label, ic("chev")));
+    return el("div", { class: "iri-ord-mbar" + (S.basketOpen ? " is-open" : "") },
+      el("button", { type: "button", class: "iri-ord-mbar-sum", "aria-expanded": String(!!S.basketOpen), "aria-controls": "iri-ord-basket",
+        onclick: function () { toggleBasket(!S.basketOpen); } },
+        el("small", null, top, el("span", { "data-bar-clock": "1" })), el("b", { text: total }),
+        el("span", { class: "more" }, t("mbar.edit"), ic("chev"))),
+      // Continue closes "Your numbers" first, so the step's own messages and focus are never hidden behind it
+      el("button", { type: "button", class: "iri-ord-btn is-light", onclick: function (e) { if (S.basketOpen) toggleBasket(false); onclick(e); } }, label, ic("chev")));
+  }
+
+  // ---------- "Your numbers": opens from the phone bar (and the desktop tray) to remove or add numbers (BRD UX05, FR03) ----------
+  // Opening and closing never re-render the step, so nothing typed into its form is lost.
+  function toggleBasket(open) {
+    var cur = mount.querySelector(".iri-ord-basket-wrap"), bar = mount.querySelector(".iri-ord-mbar"), sum = bar && bar.querySelector(".iri-ord-mbar-sum");
+    S.basketOpen = !!open;
+    if (!open) S.basketErr = null;
+    if (cur) cur.parentNode.removeChild(cur);
+    var sh = open ? basketSheet(S.barStep) : null;
+    if (sh) mount.appendChild(sh);
+    if (bar) bar.classList.toggle("is-open", !!sh);
+    if (sum) sum.setAttribute("aria-expanded", String(!!sh));
+    focusFirst(sh ? ["#iri-ord-basket-h"] : [".iri-ord-mbar-sum", ".iri-ord-tray-edit"]);
+  }
+  // Focus the first of these that is on screen (headings get tabindex=-1)
+  function focusFirst(sels) {
+    for (var i = 0; i < sels.length; i++) {
+      var f = mount.querySelector(sels[i]);
+      if (!f || f.offsetParent === null) continue;
+      if (f.tagName === "H2" && !f.hasAttribute("tabindex")) f.setAttribute("tabindex", "-1");
+      try { f.focus({ preventScroll: true }); } catch (e) { f.focus(); }
+      return f;
+    }
+    return null;
+  }
+  function heldNow(o) { return !!o && ["held", "reserving"].indexOf(o.state) >= 0; }
+  // A held number comes out through the server, which reprices, releases it and keeps the other inputs.
+  // The basket keeps at least one number (removing the last one would cancel it).
+  function serverRemovable(did) {
+    var o = S.order;
+    return heldNow(o) && !S.paying && o.numbers.length > 1 && o.numbers.some(function (x) { return x.did === did; });
+  }
+  function basketSheet(step) {
+    var o = S.order, later = step !== "find";
+    var list = later ? (o && o.numbers || []).map(metaOf) : S.sel;
+    if (!list.length) { S.basketOpen = false; return null; }
+    var setup = 0, month = 0;
+    list.forEach(function (n) { var l = later ? lineOf(n.did) : n; setup += Number(l.setup || 0); month += Number(l.monthly || 0); });
+    var q = later && o.quote, fixed = 0;
+    var line = function (k, v) { return [el("dt", { text: k }), el("dd", { text: v })]; };
+    var rows = el("ul", { class: "iri-ord-lines-n" }, list.map(function (n) {
+      var l = later ? lineOf(n.did) : n;
+      // Step 1 changes the selection; a number held for this basket comes out through the server when it can
+      var held = heldNow(o) && o.numbers.some(function (x) { return x.did === n.did; });
+      var via = serverRemovable(n.did) ? "server" : later ? null : "local";
+      if (!via) fixed++;
+      return el("li", null,
+        el("div", null, el("b", { class: "iri-ord-num is-sm", text: n.display }), el("small", { text: [catLabel(catOf(n)), cityOf(n)].filter(Boolean).join(" · ") })),
+        el("div", { class: "r" }, el("span", { text: t("res.setupAmt", { amt: money(l.setup) }) }), el("small", { text: t("tray.perMonth", { amt: money(l.monthly) }) }),
+          via ? el("button", { type: "button", class: "iri-ord-link is-rm", "data-rm": n.did, "aria-label": t("chips.remove", { label: n.display }),
+            onclick: function (e) { removeNum(n, e.currentTarget, via === "server" && held); } }, t("basket.remove")) : null));
+    }));
+    var more = later || list.length < cfg.maxNumbers;
+    var help = !later ? (more ? t("basket.max", { max: cfg.maxNumbers }) : t("basket.full", { max: cfg.maxNumbers }))
+      : list.length === 1 ? t("basket.only") : fixed ? t("basket.someFixed") : t("basket.laterNote");
+    var sheet = el("div", { id: "iri-ord-basket", class: "iri-ord-basket", role: "dialog", "aria-modal": "true", "aria-labelledby": "iri-ord-basket-h" },
+      el("div", { class: "iri-ord-basket-h" },
+        el("h2", { id: "iri-ord-basket-h", tabindex: "-1", text: tn("basket.title", list.length) }),
+        el("button", { type: "button", class: "iri-ord-icon", "aria-label": t("basket.close"), title: t("basket.close"), onclick: function () { toggleBasket(false); } }, ic("x"))),
+      el("p", { id: "iri-ord-basket-live", class: "sr", role: "status" }),
+      S.basketErr ? callout("error", "", S.basketErr) : null,
+      rows,
+      el("dl", { class: "iri-ord-dl" }, q ? line(t("rev.due"), money(q.dueToday)) : null,
+        line(t("tray.setup"), money(q ? q.setup : setup)), line(t("tray.monthly"), t("tray.perMonth", { amt: money(q ? q.monthly : month) }))),
+      el("p", { class: "iri-ord-help", text: help }),
+      el("div", { class: "iri-ord-actions" },
+        more ? el("button", { type: "button", class: "iri-ord-btn is-secondary", onclick: function () { addMore(later); } }, ic("plus"), t(later ? "basket.change" : "basket.add")) : null,
+        el("button", { type: "button", class: "iri-ord-btn", onclick: function () { toggleBasket(false); } }, t("basket.done"))));
+    return el("div", { class: "iri-ord-basket-wrap" }, el("div", { class: "iri-ord-basket-bg", "aria-hidden": "true", onclick: function () { toggleBasket(false); } }), sheet);
+  }
+  // While "Your numbers" is open: Escape closes it and Tab stays inside it, wherever focus is
+  document.addEventListener("keydown", function (e) {
+    var sheet = S && S.basketOpen && mount && mount.querySelector("#iri-ord-basket");
+    if (!sheet) return;
+    if (e.key === "Escape") { e.preventDefault(); toggleBasket(false); return; }
+    if (e.key !== "Tab") return;
+    var f = Array.prototype.filter.call(sheet.querySelectorAll("button:not([disabled]), [href]"), function (x) { return x.offsetParent !== null; });
+    if (!f.length) return;
+    var a = document.activeElement, first = f[0], last = f[f.length - 1], inside = sheet.contains(a) && a !== sheet.querySelector("h2");
+    if (e.shiftKey && (!inside || a === first)) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && (!sheet.contains(a) || a === last)) { e.preventDefault(); first.focus(); }
+  });
+  function addMore(later) {
+    if (later) return go("find");
+    toggleBasket(false);
+    // The results are where numbers are added; with none on screen, the search box
+    var to = focusFirst([".iri-ord-reshead h2", ".iri-ord-search .q"]);
+    if (to) to.scrollIntoView({ block: "start" });
+  }
+  // Remove one number: from the selection on step 1, or from the held basket through the server (repriced; the other
+  // inputs stay). Used by "Your numbers" and by the review step's number list.
+  function removeNum(n, btn, viaServer) {
+    if (S.paying || S.removing) return;
+    var ownFocus = null;
+    var at = Array.prototype.map.call(mount.querySelectorAll("[data-rm]"), function (b) { return b.getAttribute("data-rm"); }).indexOf(n.did);
+    var done = function () {
+      var y = window.scrollY;
+      rerender();
+      window.scrollTo(0, y);
+      // Focus moves only while the panel is still open or when it was lost in the re-render (not if the customer has moved on)
+      var a = document.activeElement, left = mount.querySelectorAll("[data-rm]"), f = left[Math.min(at, left.length - 1)];
+      if (S.basketOpen || !a || a === document.body || (ownFocus && a.id === ownFocus.id)) {
+        if (f) { try { f.focus({ preventScroll: true }); } catch (e) { f.focus(); } }
+        else focusFirst(["#iri-ord-basket-h", "#iri-ord-yn-h", ".iri-ord-mbar-sum", ".iri-ord-tray-edit", ".iri-ord-reshead h2", ".iri-ord-main h1", ".iri-ord-search .q"]);
+      }
+      // After the re-render, so the message lands in the live region that is on the page (inside the open panel if there is one)
+      var count = S.view === "find" ? S.sel.length : (S.order && S.order.numbers.length) || 0;
+      var msg = t("res.removed", { n: n.display }) + (count ? " " + tn("tray.count", count) + "." : "");
+      var live = mount.querySelector("#iri-ord-basket-live");
+      if (live) setTimeout(function () { live.textContent = msg; }, 50); else say(msg);
+    };
+    S.basketErr = null;
+    if (!viaServer) {
+      S.sel = S.sel.filter(function (x) { return x.did !== n.did; });
+      save();
+      return done();
+    }
+    // One removal at a time; focus moves off the button before it's disabled, so Escape and Tab keep working
+    S.removing = true;
+    ownFocus = focusFirst(["#iri-ord-basket-h", "#iri-ord-yn-h"]);
+    mount.querySelectorAll("[data-rm]").forEach(function (b) { b.disabled = true; });
+    busy(btn, true, t("basket.removing"));
+    api("/basket/remove", { body: { did: n.did } }).then(function (j) {
+      S.removing = false;
+      S.order = j.order;
+      if (!heldNow(S.order)) return route();
+      S.sel = S.view === "find" ? S.sel.filter(function (x) { return x.did !== n.did; }) : S.order.numbers.map(function (x) { return metaOf(x); });
+      save();
+      if (S.view === "review") S.notice = callout("success", "", t("basket.revRemoved", { n: n.display, amt: money(S.order.quote.dueToday) }));
+      done();
+    }).catch(function (e) {
+      S.removing = false;
+      if (e.handled) return;
+      busy(btn, false);
+      mount.querySelectorAll("[data-rm]").forEach(function (b) { b.disabled = false; });
+      if (S.basketOpen) { S.basketErr = errText(e); return toggleBasket(true); }
+      S.notice = callout("error", "", errText(e));
+      rerender();
+    });
   }
 
   // ---------- Iris rail (live Iris lives in the site's dock; this column carries her context and cards) ----------
@@ -682,7 +832,9 @@
   // ---------- step 1: find a number ----------
   function findStep() {
     S.view = "find"; S.render = findStep;
-    if (S.order && S.order.state === "held" && !S.sel.length) S.sel = S.order.numbers.map(function (n) { return metaOf(n); });
+    // Coming back with a hold: start from the held numbers once (later, an emptied selection stays empty)
+    if (!S.seeded && S.order && S.order.state === "held" && !S.sel.length) S.sel = S.order.numbers.map(function (n) { return metaOf(n); });
+    S.seeded = true;
     if (qs("preview") === "states" && S.demo) return statesGallery();
     var landing = !S.results && !S.searching;
     document.body.classList.toggle("iri-ord-compact", !landing);
@@ -696,7 +848,7 @@
           return el("li", null, el("span", { class: "n", text: String(i) }), el("strong", { text: t("how." + i + ".t") }), el("p", { text: t("how." + i + ".d", { max: cfg.maxNumbers }) }));
         })),
         el("ul", { class: "iri-ord-trust" }, el("li", null, ic("shield"), t("trust.prices")), el("li", null, ic("lock"), t("trust.pay")), el("li", null, ic("info"), "English | Français")),
-        S.porting ? el("div", { class: "iri-ord-landing-card" }, portingCard()) : null), { rail: false, cls: "is-landing" });
+        S.porting ? el("div", { class: "iri-ord-landing-card" }, portingCard()) : null, S.sel.length ? tray() : null), { rail: false, cls: "is-landing", bar: findBar() });
       S.notice = null;
       return;
     }
@@ -704,10 +856,14 @@
     var main = [searchBox(false), chipRow(), S.search.more ? filtersPanel() : null, S.notice || null, box,
       el("p", { class: "iri-ord-foot" }, t("find.calling", { ca: money(RATES.ca, 3), us: money(RATES.us, 3), e911: money(RATES.e911) }))];
     drawResults(box);
+    frame("find", main, { bar: findBar() });
+    S.notice = null;
+  }
+  function findBar() {
+    if (!S.sel.length) return null;
     var setup = 0, month = 0;
     S.sel.forEach(function (n) { setup += Number(n.setup || 0); month += Number(n.monthly || 0); });
-    frame("find", main, { bar: S.sel.length ? mobileBar(tn("tray.count", S.sel.length), t("mbar.total", { setup: money(setup), month: money(month) }), t("mbar.continue"), function (e) { cont(e.currentTarget); }) : null });
-    S.notice = null;
+    return mobileBar(tn("tray.count", S.sel.length), t("mbar.total", { setup: money(setup), month: money(month) }), t("mbar.continue"), function (e) { cont(e.currentTarget); });
   }
   function modeToggle() {
     var g = el("div", { class: "iri-ord-mode", role: "radiogroup", "aria-label": t("mode.label") });
@@ -925,10 +1081,10 @@
     else if (S.sel.length < cfg.maxNumbers) S.sel.push({ did: n.did, display: n.display, category: n.category, cat: catOf(n), rc: n.rc, location: n.location,
       setup: n.setup, monthly: n.monthly, match: n.match || null });
     save();
-    say(i >= 0 ? t("res.removed", { n: n.display }) : t("res.added", { n: n.display }));
     var y = window.scrollY;
     rerender();
     window.scrollTo(0, y);
+    say(i >= 0 ? t("res.removed", { n: n.display }) : t("res.added", { n: n.display }));
     var b = mount.querySelector('[data-did="' + n.did + '"]'); if (b) { try { b.focus({ preventScroll: true }); } catch (e) { b.focus(); } }
   }
   function tray() {
@@ -936,7 +1092,8 @@
     S.sel.forEach(function (n) { setup += Number(n.setup || 0); month += Number(n.monthly || 0); });
     var cell = function (k, v) { return el("div", { class: "cell" }, el("small", { text: k }), el("b", null, v)); };
     return el("div", { class: "iri-ord-tray", role: "region", "aria-label": t("tray.label") },
-      cell(t("tray.selected"), tn("tray.count", S.sel.length)),
+      cell(t("tray.selected"), [tn("tray.count", S.sel.length), " ", el("button", { type: "button", class: "iri-ord-link is-light iri-ord-tray-edit", "aria-haspopup": "dialog",
+        onclick: function () { toggleBasket(true); } }, t("mbar.edit"))]),
       held ? cell(t("tray.held"), el("span", { "data-hold-clock": "1", text: "--:--" })) : null,
       cell(t("tray.setup"), money(setup)), cell(t("tray.monthly"), t("tray.perMonth", { amt: money(month) })),
       el("p", { class: "note", text: cfg.prices && cfg.prices.approved ? t("tray.noteFinal") : t("tray.noteEx") }),
@@ -956,9 +1113,23 @@
     busy(btn, true, t("busy.hold"));
     var meta = {};
     nums.forEach(function (n) { meta[n.did] = { cat: n.cat || catOf(n), match: n.match || null }; });
+    var prev = S.token ? ui() : null, had = heldNow(S.order) ? S.order.numbers.map(function (n) { return n.did; }) : [];
     api("/hold", { body: { numbers: nums.map(function (n) { return { did: n.did, rc: n.rc || null }; }), token: S.token || undefined, demo: S.demo || undefined } })
       .then(function (j) {
-        S.token = j.token; S.order = j.order; ui().meta = meta; save();
+        S.token = j.token; S.order = j.order;
+        var u = ui();
+        if (prev && prev !== u) {
+          if (prev.details && !u.details) u.details = prev.details;
+          if (prev.conn && !u.conn) u.conn = prev.conn;
+          if (prev.e911 && !u.e911) { u.e911 = JSON.parse(JSON.stringify(prev.e911)); u.e911.done = false; u.e911.confirms = [false, false, false]; u.e911.rcOk = false; }
+        }
+        // Same basket with numbers added (the server changes a held basket in place): the 9-1-1 address must be confirmed
+        // again for the new numbers
+        if (prev === u && u.e911 && S.order.numbers.some(function (n) { return had.indexOf(n.did) < 0; })) {
+          u.e911.done = false; u.e911.confirms = [false, false, false]; u.e911.rcOk = false;
+        }
+        for (var k in meta) (u.meta = u.meta || {})[k] = meta[k];
+        save();
         return waitHeld(30);
       })
       .then(function () { S.sel = S.order.numbers.map(function (n) { return metaOf(n); }); save(); go("account"); })
@@ -1020,7 +1191,9 @@
   }
   function signInPanel() {
     var on = !!(S.demo && P);
-    var email = input("email", "", { type: "email", autocomplete: "username", disabled: on ? null : true }), pw = input("password", "", { type: "password", autocomplete: "current-password", disabled: on ? null : true });
+    // The typed email survives a re-render (e.g. a number removed from "Your numbers"); kept in memory only, never the password
+    var email = input("email", S.signinEmail || "", { type: "email", autocomplete: "username", disabled: on ? null : true }), pw = input("password", "", { type: "password", autocomplete: "current-password", disabled: on ? null : true });
+    email.addEventListener("input", function () { S.signinEmail = email.value; });
     var form = el("form", { class: "iri-ord-panel", role: "tabpanel", id: "iri-ord-panel-signin", "aria-labelledby": "iri-ord-tab-signin", novalidate: true },
       el("p", { class: "iri-ord-help", text: t("acct.signinLede") }),
       on ? callout("demo", t("acct.demoT"), t("acct.demo")) : callout("", t("acct.soonT"), t("acct.soon")),
@@ -1486,7 +1659,9 @@
       var mm = metaOf(x), l = lineOf(x.did);
       return el("li", null, el("div", null, el("b", { class: "iri-ord-num is-sm", text: x.display }),
         el("small", { text: [catLabel(catOf(mm)), mm.match ? mm.match.full : null, t("mode." + S.mode), destLabel(c, x.did), t("rev.e911at", { a: addrFor(x.did) })].filter(Boolean).join(" · ") })),
-        el("div", { class: "r" }, el("span", { text: t("res.setupAmt", { amt: money(l.setup) }) }), el("small", { text: t("tray.perMonth", { amt: money(l.monthly) }) })));
+        el("div", { class: "r" }, el("span", { text: t("res.setupAmt", { amt: money(l.setup) }) }), el("small", { text: t("tray.perMonth", { amt: money(l.monthly) }) }),
+          serverRemovable(x.did) ? el("button", { type: "button", class: "iri-ord-link is-rm", "data-rm": x.did, "aria-label": t("chips.remove", { label: x.display }),
+            onclick: function (ev) { removeNum(x, ev.currentTarget, true); } }, t("basket.remove")) : null));
     }));
     var line = function (k, v, cls) { return [el("dt", { class: cls || null }, k), el("dd", { class: cls || null }, v)]; };
     var usage = path === "iristel" ? [line(t("use.na"), t("rate.inclFair")), line(t("use.e911"), t("rate.incl")), line(t("use.in"), t("rate.incl"))]
@@ -1497,6 +1672,7 @@
       el("div", { class: "iri-ord-cardhead" }, el("h2", { id: "iri-ord-yn-h", text: t("rev.numbers") }),
         el("a", { class: "iri-ord-link", href: url("connect"), onclick: function (ev) { ev.preventDefault(); go("connect"); } }, ic("pencil"), t("rev.edit"))),
       nums,
+      heldNow(o) ? el("p", { class: "iri-ord-rev-more" }, el("a", { class: "iri-ord-link", href: url("find"), onclick: function (ev) { ev.preventDefault(); if (!S.paying) go("find"); } }, ic("plus"), t("basket.change"))) : null,
       el("dl", { class: "iri-ord-dl" },
         line(tn("rev.setupN", n), money(q.setup)), line(t("rev.first"), money(q.firstMonth)),
         line(t("rev.sub"), money(q.subtotal)), line(t(q.approved ? "rev.tax" : "rev.taxEx", { tax: pct(q.taxRate) }), money(q.tax))),
@@ -1552,9 +1728,12 @@
       var consents = { terms: f("terms"), recurring: S.mode === "rent" ? f("recurring") : true };
       if (!consents.terms || !consents.recurring) return showErrors(form, { consents: S.mode === "rent" ? t("pay.needBoth") : t("pay.needTerms") });
       busy(btn, true, S.demo ? t("busy.payDemo") : t("busy.pay"));
+      S.paying = true; mount.classList.add("is-paying");
       api("/pay", { body: { amount: q.dueToday, quoteVersion: q.version, consents: consents, card: card } })
         .then(function (j) { S.order = j.order; S.cardDraft = null; save(); go("order", "?ref=" + encodeURIComponent(j.order.ref) + "&t=" + encodeURIComponent(S.token)); })
         .catch(function (err) {
+          // An unknown payment outcome keeps the basket locked (and Pay disabled) until the page is checked again
+          if (err.code !== "PAYMENT_UNKNOWN" && err.code !== "PAYMENT_PENDING") { S.paying = false; mount.classList.remove("is-paying"); }
           var cv = form.querySelector('[name="cvv"]'); if (cv) cv.value = "";
           if (err.code === "PRICE_CHANGED" && err.data && err.data.order) { var old = S.order.quote; S.order = err.data.order; return reviewStep(priceChanged(old, S.order.quote)); }
           if (err.handled) return;
@@ -1768,11 +1947,12 @@
     if (S.step === "connect" && S.sub === "e911" && !o.connect) { S.sub = null; }
     return ({ account: accountStep, connect: connectStep, review: function () { reviewStep(); } })[S.step]();
   }
-  // Back from turning Iris on (a page reload): show the same search results again, not the landing.
-  // Results aren't saved, only the search and its filters, so the search runs again once the step is up.
+  // Back on step 1 with numbers chosen (from a later step, or after turning Iris on): show the same search results again,
+  // not the landing. Results aren't saved, only the search and its filters, so the search runs again once the step is up.
   function land() {
     route();
-    if (S.irisNote && S.render === findStep && S.search.q && S.search.filters) runSearch(0);
+    var f = S.search.filters;
+    if ((S.irisNote || S.sel.length) && S.render === findStep && f && (f.province || f.ratecenter || f.areaCode)) runSearch(0);
   }
   function unavailable() {
     S.render = unavailable;
@@ -1783,7 +1963,13 @@
     mount = document.getElementById("iri-ord");
     // html.iri-ord-iris scopes the Iris tweaks in app.css to these pages (removed after a swup visit elsewhere)
     document.documentElement.classList.toggle("iri-ord-iris", !!mount);
-    if (!mount || mount.getAttribute("data-ready")) return;
+    if (!mount) {
+      clearInterval(timer); clearTimeout(poller);
+      if (S) S.basketOpen = false;
+      if (barSpace.ro) { barSpace.ro.disconnect(); barSpace.ro.el = null; }
+      return;
+    }
+    if (mount.getAttribute("data-ready")) return;
     // Iris starts only from "Ask Iris (AI)" here: the widget's own once-per-visit flag turns its auto-start off
     try { sessionStorage.setItem("iris_greeted", "1"); } catch (e) {}
     var irisJustOn = false;

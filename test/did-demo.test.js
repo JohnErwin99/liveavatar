@@ -18,7 +18,7 @@ globalThis.fetch = async (url) => { outside.push(String(url)); throw new Error("
 
 const demo = await import("../lib/did-demo.js");
 const { searchPlan, inventoryFilters, matchesPattern, isNanp10, ten, pruneStore, getOrder } = await import("../lib/did-orders.js");
-const { createDidRouter } = await import("../lib/did-routes.js");
+const { createDidRouter, _internal } = await import("../lib/did-routes.js");
 
 let passed = 0;
 const failed = [];
@@ -190,6 +190,87 @@ await test("routes: demo pay with 4242 → active, no charge, no CRM lead, nothi
   assert.equal(rec.steps.crm, undefined);
   assert.equal(crmCalls, 0);
   assert.deepEqual(outside, []);
+});
+
+// ---------- changing a held basket (the "Your numbers" panel) ----------
+const basicSearch = { province: "ON", ratecenter: "TORONTO", areaCode: "416", type: "basic", demo: true };
+async function heldBasket(picks) {
+  const h = await call("POST", "/hold", { numbers: picks, demo: true });
+  assert.equal(h.status, 201, JSON.stringify(h.json));
+  await sleep(demo.DEMO_READY_MS + 300);
+  const b = await call("GET", "/basket", null, h.json.token);
+  assert.equal(b.json.order.state, "held");
+  return { token: h.json.token, order: b.json.order };
+}
+let t2, picks2, spare;
+await test("routes: search lists the customer's own held numbers first; nobody else sees them", async () => {
+  const s = await call("POST", "/search", basicSearch);
+  picks2 = s.json.results.slice(0, 2).map((n) => ({ did: n.did, rc: n.rc }));
+  spare = s.json.results.slice(2, 4).map((n) => ({ did: n.did, rc: n.rc }));
+  ({ token: t2 } = await heldBasket(picks2));
+  const mineFirst = await call("POST", "/search", basicSearch, t2);
+  assert.deepEqual(mineFirst.json.results.slice(0, 2).map((n) => [n.did, n.held]), picks2.map((p) => [p.did, true]));
+  assert.equal(new Set(mineFirst.json.results.map((n) => n.did)).size, mineFirst.json.results.length);
+  const others = await call("POST", "/search", basicSearch);
+  assert.ok(others.json.results.every((n) => !picks2.some((p) => p.did === n.did) && !n.held));
+  // a search the held numbers don't fit doesn't list them
+  const elsewhere = await call("POST", "/search", { province: "ON", areaCode: "613", demo: true }, t2);
+  assert.ok(elsewhere.json.results.every((n) => !n.held));
+});
+
+await test("routes: changing the numbers keeps the basket, its details and connection; only new numbers are reserved", async () => {
+  let r = await call("POST", "/details", details, t2);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  r = await call("POST", "/connect", { type: "forward", forwardTo: "6135550199" }, t2);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const before = getOrder(r.json.order.ref);
+  const h = await call("POST", "/hold", { numbers: [picks2[0], spare[0]], demo: true, token: t2 });
+  assert.equal(h.status, 200, JSON.stringify(h.json));
+  assert.equal(h.json.order.ref, before.ref);
+  assert.deepEqual(h.json.order.numbers.map((n) => n.did).sort(), [picks2[0].did, spare[0].did].sort());
+  assert.ok(h.json.order.details && h.json.order.connect, "details and connection kept");
+  const rec = getOrder(before.ref);
+  assert.equal(rec.espresso.length, 2, "one new Espresso order, for the new number only");
+  assert.deepEqual(rec.espresso[1].dids, [spare[0].did]);
+  assert.ok(["reserving", "ready"].includes(rec.espresso[0].state), "the first order still holds the kept number");
+  await sleep(demo.DEMO_READY_MS + 300);
+  assert.equal((await call("GET", "/basket", null, t2)).json.order.state, "held");
+});
+
+await test("routes: removing every number of one Espresso order releases it; completing assigns only kept numbers", async () => {
+  const ref = getOrder((await call("GET", "/basket", null, t2)).json.order.ref).ref;
+  let r = await call("POST", "/basket/remove", { did: spare[0].did }, t2);
+  assert.equal(r.status, 200);
+  const rec = getOrder(ref), [first, second] = rec.espresso;
+  assert.equal(second.state, "cancelled");
+  assert.equal((await demo.getOrder(second.id)).status, "CANCELLED");
+  r = await call("GET", "/basket", null, t2);
+  assert.equal(r.json.order.state, "held");
+  const q = r.json.order.quote;
+  r = await call("POST", "/pay", { amount: q.dueToday, quoteVersion: q.version, consents: { terms: true, recurring: true }, card: card("4242424242424242") }, t2);
+  assert.equal(r.status, 202, JSON.stringify(r.json));
+  let o;
+  for (let i = 0; i < 20; i++) { o = (await call("GET", "/order", null, t2)).json.order; if (o.state === "active") break; await sleep(100); }
+  assert.equal(o.state, "active");
+  assert.deepEqual(o.numbers.map((n) => n.did), [picks2[0].did]);
+  assert.deepEqual((await demo.getOrder(first.id)).numbers.map((n) => n.did), [`1${picks2[0].did}`], "removed numbers are not assigned");
+  assert.equal((await demo.getOrder(second.id)).status, "CANCELLED", "the emptied order is never completed");
+});
+
+await test("routes: while a payment runs the basket can't change and a second payment is refused", async () => {
+  const { token: t3, order: o3 } = await heldBasket([spare[1], picks2[1]]);
+  _internal.payingNow.add(o3.ref);
+  try {
+    for (const [m, p, b] of [["POST", "/basket/remove", { did: spare[1].did }], ["POST", "/hold", { numbers: [spare[1]], demo: true }],
+      ["POST", "/details", details], ["POST", "/connect", { type: "iristel" }],
+      ["POST", "/pay", { amount: o3.quote.dueToday, quoteVersion: o3.quote.version, consents: { terms: true, recurring: true }, card: card("4242424242424242") }]]) {
+      const r = await call(m, p, b, t3);
+      assert.equal(r.status, 409, `${p}: ${JSON.stringify(r.json)}`);
+      assert.equal(r.json.code, "PAYMENT_PENDING", p);
+    }
+  } finally { _internal.payingNow.delete(o3.ref); }
+  assert.equal(getOrder(o3.ref).numbers.filter((n) => !n.removed).length, 2);
+  assert.equal((await call("POST", "/basket/remove", { did: spare[1].did }, t3)).status, 200);
 });
 
 await test("store: demo orders are dropped a day after their last change", async () => {
