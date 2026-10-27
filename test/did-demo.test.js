@@ -122,6 +122,24 @@ const details = { segment: "residential", firstName: "Ana", lastName: "Li", emai
   address1: "1 Main St", city: "Toronto", province: "ON", postalCode: "M5V 3L9" };
 const card = (number) => ({ holder: "Ana Li", number, expMonth: "12", expYear: String(new Date().getFullYear() + 1), cvv: "123" });
 
+await test("routes: the page scripts are served minified and still parse; the CSS as it is", async () => {
+  const get = (p) => new Promise((resolve, reject) => {
+    http.get({ host: "127.0.0.1", port, path: "/did" + p, agent: false }, (res) => {
+      let s = ""; res.on("data", (c) => { s += c; }); res.on("end", () => resolve({ status: res.statusCode, type: res.headers["content-type"], body: s }));
+    }).on("error", reject);
+  });
+  for (const f of ["app.js", "i18n.js", "preview.js"]) {
+    const src = fs.readFileSync(new URL(`../public/did/${f}`, import.meta.url), "utf8");
+    const r = await get("/" + f);
+    assert.equal(r.status, 200, f);
+    assert.match(r.type, /application\/javascript/, f);
+    assert.ok(r.body.length < src.length && r.body.split("\n").length === 1, `${f}: ${r.body.length} of ${src.length}`);
+    assert.doesNotThrow(() => new Function(r.body), f);
+  }
+  const css = await get("/app.css");
+  assert.equal(css.body, fs.readFileSync(new URL("../public/did/app.css", import.meta.url), "utf8"));
+});
+
 let token, order;
 await test("routes: config says demo; a request without demo is still refused while the switch is off", async () => {
   const c = await call("GET", "/config");
