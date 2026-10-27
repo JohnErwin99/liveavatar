@@ -5,7 +5,7 @@ import { readFileSync as fsReadFileSync } from "fs";
 import {
   mapLeadQualification, qualificationPatch, normalizeSegment, splitList, canonicalProduct, optionIndex,
   stampedBlock, appendBlock, hasBlock, dedupeLines, quoteRequestRef, buildQuoteRequest, dcValue, buildRecapNote,
-  recapBlock, timelineFromDetails,
+  recapBlock, timelineFromDetails, fmtStamp,
 } from "./lib/lead-qualification.js";
 import { createDidRouter } from "./lib/did-routes.js";
 
@@ -591,7 +591,7 @@ async function upsertCustomerContact({ first_name, last_name, email, company, to
       method: "POST",
       headers: H,
       body: JSON.stringify({
-        subject: `Iris conversation — ${new Date().toISOString().slice(0, 16)}`,
+        subject: `Iris conversation — ${fmtStamp()}`,  // Toronto time, like the Form Answers stamps
         notetext: noteLines.join("\n").slice(0, 4000),
         "objectid_contact@odata.bind": `/contacts(${contactId})`,
       }),
