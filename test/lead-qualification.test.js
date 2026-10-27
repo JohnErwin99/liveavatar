@@ -210,10 +210,10 @@ test("qualificationPatch fillOnly fills empty fields only (products still merged
 
 // ---- stamped answers block ----
 
-test("fmtStamp / fmtDate use Toronto time", () => {
-  assert.equal(fmtStamp(new Date("2026-10-19T14:05:00Z")), "2026-10-19 10:05 ET");
-  assert.equal(fmtDate(new Date("2026-10-20T02:00:00Z")), "2026-10-19");
-  assert.equal(fmtStamp(new Date("2026-01-15T17:30:00Z")), "2026-01-15 12:30 ET");
+test("fmtStamp / fmtDate use UTC", () => {
+  assert.equal(fmtStamp(new Date("2026-10-19T14:05:00Z")), "2026-10-19 14:05 UTC");
+  assert.equal(fmtDate(new Date("2026-10-20T02:00:00Z")), "2026-10-20");
+  assert.equal(fmtStamp(new Date("2026-01-15T17:30:00Z")), "2026-01-15 17:30 UTC");
 });
 
 test("stampedBlock: date, source, what they asked for, deduped answers", () => {
@@ -222,12 +222,14 @@ test("stampedBlock: date, source, what they asked for, deduped answers", () => {
     lines: ["Country: Canada", "", "Message: hi", "Country: Canada"],
   });
   assert.equal(block, [
-    "--- 2026-10-19 10:05 ET · Website contact form ---",
+    "--- 2026-10-19 14:05 UTC · Website contact form ---",
     "Asked for: SIP trunking",
     "Country: Canada",
     "Message: hi",
   ].join("\n"));
-  assert.match(stampedBlock({ source: "iris", lines: ["x"] }), /^--- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (ET|UTC) · Iris \(AI assistant\) ---\nx$/);
+  // Late evening in Toronto is already the next day in UTC.
+  assert.match(stampedBlock({ source: "website-form", at: new Date("2026-10-20T02:30:00Z"), lines: ["x"] }), /^--- 2026-10-20 02:30 UTC · Website contact form ---\n/);
+  assert.match(stampedBlock({ source: "iris", lines: ["x"] }), /^--- \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC · Iris \(AI assistant\) ---\nx$/);
   assert.doesNotMatch(block, /conv_|New conversation/);
 });
 
@@ -259,9 +261,9 @@ const CATALOG = {
   cc_setup_fee: { name: "Cloud Contact Center Set Up (one-time)", price: 4000 },
 };
 
-test("QR reference format QR-YYMMDD-XXXX (Toronto date)", () => {
+test("QR reference format QR-YYMMDD-XXXX (UTC date)", () => {
   const seq = [0, 1, 2, 31];
-  assert.equal(quoteRequestRef(new Date("2026-10-20T02:00:00Z"), () => seq.shift()), "QR-261019-ABC9");
+  assert.equal(quoteRequestRef(new Date("2026-10-20T02:00:00Z"), () => seq.shift()), "QR-261020-ABC9");
   for (let i = 0; i < 50; i++) assert.match(quoteRequestRef(), /^QR-\d{6}-[A-Z0-9]{4}$/);
 });
 
@@ -439,14 +441,14 @@ test("appendBlock: an oversized block keeps its head", () => {
 
 // ---- Iris recap in Form Answers ----
 
-test("recap block: ET header at call end with duration, fields line, bullets, no blank lines or ids", () => {
+test("recap block: UTC header at call end with duration, fields line, bullets, no blank lines or ids", () => {
   const block = recapBlock({
     at: new Date("2026-10-19T14:05:00Z"), durationSecs: 200,
     country: "Canada", segment: "enterprise", products: "SIP Trunking, fax to email",
     recap: "Needs:\n• SIP trunks for 40 users\n\n• 3CX PBX, 20 channels\nNext step:\n• Quote by Friday",
   });
   assert.equal(block, [
-    "--- 2026-10-19 10:05 ET · Iris recap (3 min 20 s) ---",
+    "--- 2026-10-19 14:05 UTC · Iris recap (3 min 20 s) ---",
     "Country: Canada · Segment: Enterprise · Products: SIP trunking, Not sure / other (fax to email)",
     "Needs:",
     "- SIP trunks for 40 users",
@@ -459,7 +461,7 @@ test("recap block: ET header at call end with duration, fields line, bullets, no
 
 test("recap block: optional parts omitted; a bullet repeated under two headings is kept", () => {
   const block = recapBlock({ at: new Date("2026-10-19T14:05:00Z"), recap: "A:\n- same\nB:\n- same", segment: "unknown" });
-  assert.equal(block, "--- 2026-10-19 10:05 ET · Iris recap ---\nA:\n- same\nB:\n- same");
+  assert.equal(block, "--- 2026-10-19 14:05 UTC · Iris recap ---\nA:\n- same\nB:\n- same");
 });
 
 test("recap block is null exactly when the recap note is", () => {
@@ -476,7 +478,7 @@ test("recap block: capped at whole lines, header kept, history survives the appe
   const recap = Array.from({ length: 300 }, (_, i) => `- point number ${i} about the customer's needs`).join("\n");
   const block = recapBlock({ at: new Date("2026-10-19T14:05:00Z"), durationSecs: 61, recap });
   assert.ok(block.length <= RECAP_BLOCK_MAX, String(block.length));
-  assert.ok(block.startsWith("--- 2026-10-19 10:05 ET · Iris recap (1 min 1 s) ---\n- point number 0 "));
+  assert.ok(block.startsWith("--- 2026-10-19 14:05 UTC · Iris recap (1 min 1 s) ---\n- point number 0 "));
   assert.ok(block.endsWith("\n[truncated]"));
   assert.match(block.split("\n").slice(-2)[0], /^- point number \d+ about the customer's needs$/);
   // History + recap over 4000: the older block keeps its head, not wiped.
